@@ -4,14 +4,40 @@ How to fetch every dataset in the registry, what each one's archives contain, an
 where things stand. For *why* these datasets (licenses, quality, overlap audit) see
 [datasets.md](datasets.md). Status last updated: **2026-06-11 ~15:00 PT**.
 
+## 0. One-time setup (do this BEFORE any `make data`)
+
+Per-source prerequisites — only needed for the sources you actually pull, but
+`make data-all` needs **all** of them:
+
+```bash
+# base downloader deps (gdown etc.) into the lpr conda env — already done on this box
+make env
+
+# Roboflow (rxg4e, lhqow): free account → app.roboflow.com → Settings → API → copy key
+pip install roboflow
+export ROBOFLOW_API_KEY=...          # put it in your shell rc; the downloader reads env
+
+# Kaggle (kaggle_andrewmvd): kaggle.com → Account → Create New API Token
+pip install kaggle                   # then place the downloaded token:
+mkdir -p ~/.kaggle && mv ~/Downloads/kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
+
+# Open Images (open_images_vrp): heavy dep (bundles mongodb), install only when needed
+pip install fiftyone
+```
+
+No setup needed for: `openalpr` (git clone), `ccpd`/`crpd` (Google Drive via gdown),
+`uc3m_lp` (direct Zenodo URL).
+
+## 1. Download
+
 All commands run from the repo root. Downloads are **resumable and idempotent**:
 every archive is banked individually (`.extracted_*` markers in `data/raw/<key>/`),
 so re-running the same command fetches only what's missing.
 
 ```bash
-make data DATASETS="ccpd crpd"     # any subset of keys
-make data-all                      # everything registered
 python scripts/build_datasets.py --list   # registry + license tiers
+make data DATASETS="ccpd crpd"     # any subset of keys (only their prereqs needed)
+make data-all                      # everything registered (needs ALL prereqs above)
 ```
 
 ## Status at a glance
