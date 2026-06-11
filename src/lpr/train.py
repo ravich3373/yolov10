@@ -120,6 +120,14 @@ def collate(batch):
     return imgs, [b[1] for b in batch]  # variable box counts -> list
 
 
+def _worker_init(_):
+    """cv2 spawns its own thread pool per dataloader worker — with many workers
+    that oversubscribes every core and slows decoding down."""
+    import cv2
+
+    cv2.setNumThreads(0)
+
+
 # ---------------------------------------------------------------------------
 # Task-aligned assignment (standalone, single-class)
 # ---------------------------------------------------------------------------
@@ -136,49 +144,63 @@ def box_iou(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def assign_targets(
-    plate_prob: torch.Tensor,  # (A,) sigmoid plate score for ONE image
-    pred_boxes: torch.Tensor,  # (A, 4) decoded xyxy pixels (frozen branch, no grad)
+    plate_prob: torch.Tensor,  # (B, A) sigmoid plate scores
+    pred_boxes: torch.Tensor,  # (B, A, 4) decoded xyxy pixels (frozen branch, no grad)
     anchor_xy: torch.Tensor,  # (A, 2) anchor centers in pixels
-    gt_boxes: torch.Tensor,  # (n, 4) xyxy pixels
+    gt_list: list[torch.Tensor],  # per-image (n, 4) xyxy pixels
     topk: int,
     alpha: float = 0.5,
     beta: float = 6.0,
 ) -> torch.Tensor:
-    """-> (A,) soft target score per anchor (0 for background). YOLOv8 TAL semantics."""
-    A = plate_prob.shape[0]
-    targets = torch.zeros(A, device=plate_prob.device)
-    if len(gt_boxes) == 0:
-        return targets
+    """-> (B, A) soft target score per anchor (0 for background). YOLOv8 TAL
+    semantics, fully batched — a per-image Python loop costs ~B sequential GPU
+    launches per step and dominated the step time at real batch sizes."""
+    B, A = plate_prob.shape
+    device = plate_prob.device
+    N = max((len(g) for g in gt_list), default=0)
+    if N == 0:
+        return torch.zeros(B, A, device=device)
+    gt = torch.zeros(B, N, 4, device=device)
+    valid = torch.zeros(B, N, dtype=torch.bool, device=device)
+    for b, g in enumerate(gt_list):
+        if len(g):
+            gt[b, : len(g)] = g
+            valid[b, : len(g)] = True
 
-    # candidates: anchor center strictly inside the GT box
-    inside = (
-        (anchor_xy[:, None, 0] > gt_boxes[None, :, 0]) & (anchor_xy[:, None, 0] < gt_boxes[None, :, 2])
-        & (anchor_xy[:, None, 1] > gt_boxes[None, :, 1]) & (anchor_xy[:, None, 1] < gt_boxes[None, :, 3])
-    )  # (A, n)
-    iou = box_iou(pred_boxes, gt_boxes)  # (A, n)
-    align = plate_prob[:, None].pow(alpha) * iou.pow(beta) * inside  # (A, n)
+    # candidates: anchor center strictly inside a (real) GT box  -> (B, A, N)
+    ax, ay = anchor_xy[None, :, None, 0], anchor_xy[None, :, None, 1]
+    inside = (ax > gt[:, None, :, 0]) & (ax < gt[:, None, :, 2]) & (ay > gt[:, None, :, 1]) & (ay < gt[:, None, :, 3])
+    keep = inside & valid[:, None, :]
 
-    # top-k candidate anchors per GT (by alignment)
+    # batched IoU (B, A, N)
+    lt = torch.maximum(pred_boxes[:, :, None, :2], gt[:, None, :, :2])
+    rb = torch.minimum(pred_boxes[:, :, None, 2:], gt[:, None, :, 2:])
+    inter = (rb - lt).clamp(min=0).prod(-1)
+    area_p = (pred_boxes[:, :, 2:] - pred_boxes[:, :, :2]).prod(-1)
+    area_g = (gt[:, :, 2:] - gt[:, :, :2]).prod(-1)
+    iou = inter / (area_p[:, :, None] + area_g[:, None, :] - inter + 1e-9)
+
+    align = plate_prob[:, :, None].pow(alpha) * iou.pow(beta) * keep
+
+    # top-k candidate anchors per GT (by alignment), over the anchor dim
     k = min(topk, A)
-    topk_idx = align.topk(k, dim=0).indices  # (k, n)
-    mask = torch.zeros_like(align, dtype=torch.bool)
-    mask.scatter_(0, topk_idx, True)
-    mask &= inside & (align > 0)
+    topk_idx = align.topk(k, dim=1).indices  # (B, k, N)
+    mask = torch.zeros_like(keep)
+    mask.scatter_(1, topk_idx, True)
+    mask &= keep & (align > 0)
 
     # an anchor claimed by several GTs goes to the one it overlaps most
-    claimed = mask.sum(1) > 1
+    claimed = mask.sum(-1) > 1  # (B, A)
     if claimed.any():
-        best_gt = iou.argmax(1)
         only_best = torch.zeros_like(mask)
-        only_best[torch.arange(A, device=mask.device), best_gt] = True
-        mask[claimed] &= only_best[claimed]
+        only_best.scatter_(2, iou.argmax(-1, keepdim=True), True)
+        mask = torch.where(claimed[..., None], mask & only_best, mask)
 
     # soft targets: alignment normalized per GT, scaled by that GT's best IoU
     align = align * mask
-    pos_align = align.amax(0, keepdim=True)  # (1, n) best alignment per gt
-    pos_iou = (iou * mask).amax(0, keepdim=True)  # (1, n) best IoU per gt
-    norm = align * pos_iou / (pos_align + 1e-9)  # (A, n)
-    return torch.maximum(targets, norm.amax(1))
+    pos_align = align.amax(1, keepdim=True)  # (B, 1, N) best alignment per gt
+    pos_iou = (iou * mask).amax(1, keepdim=True)  # (B, 1, N) best IoU per gt
+    return (align * pos_iou / (pos_align + 1e-9)).amax(-1)  # (B, A)
 
 
 # ---------------------------------------------------------------------------
@@ -186,28 +208,29 @@ def assign_targets(
 # ---------------------------------------------------------------------------
 
 
-def plate_loss(model: YOLOv10, imgs: torch.Tensor, gt_boxes: list[torch.Tensor]) -> tuple[torch.Tensor, dict]:
-    """BCE on the plate channel of both branches; everything else untouched."""
+def plate_loss(
+    model: YOLOv10, imgs: torch.Tensor, gt_boxes: list[torch.Tensor], amp: bool = True
+) -> tuple[torch.Tensor, dict]:
+    """BCE on the plate channel of both branches; everything else untouched.
+    Forward runs under bf16 autocast (safe: the trunk is frozen, gradients touch
+    only the 12 new conv tensors); assignment math is done in fp32."""
     h = model.head
-    feats = model.forward_features(imgs)
-    o2m = h._forward_branch(feats, h.cv2, h.cv3)
-    o2o = h._forward_branch([f.detach() for f in feats], h.one2one_cv2, h.one2one_cv3)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp and imgs.is_cuda):
+        feats = model.forward_features(imgs)
+        o2m = h._forward_branch(feats, h.cv2, h.cv3)
+        o2o = h._forward_branch([f.detach() for f in feats], h.one2one_cv2, h.one2one_cv3)
 
-    anchors, strides = make_anchors(feats, h.stride, 0.5)  # (A,2) feature units, (A,1)
+    anchors, strides = make_anchors([f.float() for f in feats], h.stride, 0.5)  # (A,2) feature units, (A,1)
     anchor_xy = anchors * strides  # pixel centers
+    gts = [g.to(imgs.device, non_blocking=True) for g in gt_boxes]
 
     total, stats = 0.0, {}
     for name, branch, topk in (("o2m", o2m, 10), ("o2o", o2o, 1)):
-        logits = branch["scores"][:, PLATE_CLASS]  # (B, A)
+        logits = branch["scores"][:, PLATE_CLASS].float()  # (B, A)
         with torch.no_grad():  # frozen box branch: assignment only
-            dist = h.dfl(branch["boxes"])  # (B, 4, A)
-            boxes = dist2bbox(dist, anchors.T.unsqueeze(0), xywh=False, dim=1) * strides.T  # (B,4,A) pixels
-            targets = torch.stack(
-                [
-                    assign_targets(logits[b].sigmoid(), boxes[b].T, anchor_xy, gt_boxes[b].to(imgs.device), topk)
-                    for b in range(imgs.shape[0])
-                ]
-            )  # (B, A)
+            dist = h.dfl(branch["boxes"].float())  # (B, 4, A)
+            boxes = (dist2bbox(dist, anchors.T.unsqueeze(0), xywh=False, dim=1) * strides.T).permute(0, 2, 1)
+            targets = assign_targets(logits.detach().sigmoid(), boxes, anchor_xy, gts, topk)  # (B, A)
         loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="sum") / max(targets.sum().item(), 1.0)
         total = total + loss
         stats[name] = loss.item()
@@ -223,7 +246,8 @@ def plate_loss(model: YOLOv10, imgs: torch.Tensor, gt_boxes: list[torch.Tensor])
 def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: float = 1e-3) -> dict:
     scored, n_gt = [], 0  # scored: (conf, is_true_positive)
     for imgs, gts in loader:
-        dets = model(imgs.to(device))  # (B, 300, 6) xyxy, conf, cls
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+            dets = model(imgs.to(device, non_blocking=True)).float()  # (B, 300, 6) xyxy, conf, cls
         for b in range(imgs.shape[0]):
             d = dets[b]
             d = d[(d[:, 5] == PLATE_CLASS) & (d[:, 4] >= conf_min)]
@@ -301,14 +325,24 @@ def train_plate(
     cos_lr: bool = False,  # linear decay by default, like ultralytics
     close_mosaic: int = 10,  # mosaic off for the last N epochs
     use_ema: bool = True,
+    amp: bool = True,  # bf16 autocast on the frozen forward
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    workers: int = 4,
+    workers: int = 16,
 ) -> list[dict]:
     model = model.to(device).eval()  # eval() ALWAYS: frozen BN stats; new convs don't care
     opt = torch.optim.AdamW(trainable, lr=lr)
     ema = EMA(trainable) if use_ema else None
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate, num_workers=workers, drop_last=len(train_ds) > batch_size)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, collate_fn=collate, num_workers=workers) if val_ds else None
+    loader_kw = dict(
+        batch_size=batch_size,
+        collate_fn=collate,
+        num_workers=workers,
+        pin_memory=device.startswith("cuda"),
+        persistent_workers=workers > 0,
+        prefetch_factor=4 if workers > 0 else None,
+        worker_init_fn=_worker_init if workers > 0 else None,
+    )
+    train_loader = DataLoader(train_ds, shuffle=True, drop_last=len(train_ds) > batch_size, **loader_kw)
+    val_loader = DataLoader(val_ds, **loader_kw) if val_ds else None
 
     # schedule: per-epoch decay to lr*lrf (linear or cosine) + per-iter linear warmup
     if cos_lr:
@@ -329,7 +363,7 @@ def train_plate(
             warm = min(ni / nw, 1.0) if nw else 1.0
             for g in opt.param_groups:
                 g["lr"] = lr * lf(epoch) * warm
-            loss, _ = plate_loss(model, imgs.to(device), gts)
+            loss, _ = plate_loss(model, imgs.to(device, non_blocking=True), gts, amp=amp)
             opt.zero_grad()
             loss.backward()
             opt.step()
