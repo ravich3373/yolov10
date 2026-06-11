@@ -111,7 +111,10 @@ class PlateDataset(Dataset):
                 img = np.ascontiguousarray(img[:, ::-1])
                 if len(boxes):
                     boxes[:, [0, 2]] = size - boxes[:, [2, 0]]
-        t = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1).float() / 255.0
+        # uint8 on purpose: fp32 here would 4x the dataloader/pinned-RAM footprint
+        # (32 workers x prefetch x batch of fp32 640px images ~ 80GB — it OOM-killed
+        # a shell once). Normalization happens on the GPU in _to_device.
+        t = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1).contiguous()
         return t, torch.from_numpy(boxes.reshape(-1, 4))
 
 
@@ -126,6 +129,11 @@ def _worker_init(_):
     import cv2
 
     cv2.setNumThreads(0)
+
+
+def _to_device(imgs: torch.Tensor, device: str) -> torch.Tensor:
+    """uint8 batch -> normalized fp32 on the GPU (cheap there, 4x cheaper on the bus)."""
+    return imgs.to(device, non_blocking=True).float().div_(255.0)
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +255,7 @@ def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: flo
     scored, n_gt = [], 0  # scored: (conf, is_true_positive)
     for imgs, gts in loader:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-            dets = model(imgs.to(device, non_blocking=True)).float()  # (B, 300, 6) xyxy, conf, cls
+            dets = model(_to_device(imgs, device)).float()  # (B, 300, 6) xyxy, conf, cls
         for b in range(imgs.shape[0]):
             d = dets[b]
             d = d[(d[:, 5] == PLATE_CLASS) & (d[:, 4] >= conf_min)]
@@ -338,7 +346,7 @@ def train_plate(
         num_workers=workers,
         pin_memory=device.startswith("cuda"),
         persistent_workers=workers > 0,
-        prefetch_factor=4 if workers > 0 else None,
+        prefetch_factor=2 if workers > 0 else None,
         worker_init_fn=_worker_init if workers > 0 else None,
     )
     train_loader = DataLoader(train_ds, shuffle=True, drop_last=len(train_ds) > batch_size, **loader_kw)
@@ -363,7 +371,7 @@ def train_plate(
             warm = min(ni / nw, 1.0) if nw else 1.0
             for g in opt.param_groups:
                 g["lr"] = lr * lf(epoch) * warm
-            loss, _ = plate_loss(model, imgs.to(device, non_blocking=True), gts, amp=amp)
+            loss, _ = plate_loss(model, _to_device(imgs, device), gts, amp=amp)
             opt.zero_grad()
             loss.backward()
             opt.step()
