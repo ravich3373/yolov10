@@ -71,7 +71,11 @@ class LprDataset:
         with ThreadPoolExecutor(workers) as pool:  # hashing + header reads are IO-bound
             rows = [r for r in pool.map(self._process_sample, self.iter_samples()) if r]
         if not rows:
-            raise RuntimeError(f"{self.key}: parser produced no samples — check {self.raw_dir}")
+            raise RuntimeError(
+                f"{self.key}: parser found no samples under {self.raw_dir}. If that directory is "
+                f"empty, the download silently failed — `rm {self.raw_dir / '.complete'}` and re-run "
+                f"to force a re-download; if data IS there, the parser needs adapting to its layout."
+            )
         df = pl.DataFrame(rows)
         write_manifest(df, self.manifest_path)
         return df
@@ -171,6 +175,21 @@ def gdown_file(file_id: str, dest: Path) -> Path:
         # retry after some hours or pull a mirror.
         run([sys.executable, "-m", "gdown", "--continue", f"https://drive.google.com/uc?id={file_id}", "-O", str(dest)])
     return dest
+
+
+def parse_voc_xml(text: str) -> list[tuple[str, tuple[float, float, float, float]]]:
+    """Pascal-VOC XML -> [(object name, bbox xyxy)]. Callers filter by name —
+    some datasets (IR-LPR) put plate AND per-character boxes in the same file."""
+    import xml.etree.ElementTree as ET
+
+    out = []
+    for obj in ET.fromstring(text).iter("object"):
+        bb = obj.find("bndbox")
+        if bb is None:
+            continue
+        box = tuple(float(bb.findtext(k, "0")) for k in ("xmin", "ymin", "xmax", "ymax"))
+        out.append((obj.findtext("name", ""), box))
+    return out
 
 
 def gdown_archives(archives: dict[str, str], raw_dir: Path) -> None:

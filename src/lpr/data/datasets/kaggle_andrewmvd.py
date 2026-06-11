@@ -6,23 +6,10 @@ Partially overlaps the rxg4e/keremberke lineage — the dedup stage handles that
 
 from __future__ import annotations
 
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterator
 
-from .base import LprDataset, Sample, extract, run
-
-
-def parse_voc_xml(text: str) -> list[tuple[float, float, float, float]]:
-    root = ET.fromstring(text)
-    boxes = []
-    for obj in root.iter("object"):
-        bb = obj.find("bndbox")
-        if bb is None:
-            continue
-        vals = [float(bb.findtext(k, "0")) for k in ("xmin", "ymin", "xmax", "ymax")]
-        boxes.append(tuple(vals))
-    return boxes
+from .base import LprDataset, Sample, extract, parse_voc_xml, run
 
 
 class KaggleAndrewMVD(LprDataset):
@@ -39,4 +26,4 @@ class KaggleAndrewMVD(LprDataset):
             img = xml.parent.parent / "images" / (xml.stem + ".png")
             if not img.exists():
                 continue
-            yield Sample(img, parse_voc_xml(xml.read_text()), group_key=xml.stem)
+            yield Sample(img, [b for _, b in parse_voc_xml(xml.read_text())], group_key=xml.stem)

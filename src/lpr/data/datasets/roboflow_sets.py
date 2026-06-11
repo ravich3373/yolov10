@@ -38,11 +38,14 @@ class _RoboflowDataset(LprDataset):
         key = os.environ.get("ROBOFLOW_API_KEY")
         if not key:
             raise RuntimeError("set ROBOFLOW_API_KEY (free account: app.roboflow.com -> settings -> API)")
-        self.raw_dir.mkdir(parents=True, exist_ok=True)
+        # Do NOT pre-create raw_dir: the Roboflow SDK treats an existing location
+        # as "already downloaded" and silently skips (bit us: empty dir + success).
         rf = Roboflow(api_key=key)
         rf.workspace(self.workspace).project(self.project).version(self.version).download(
-            "yolov8", location=str(self.raw_dir)
+            "yolov8", location=str(self.raw_dir), overwrite=True
         )
+        if not any(self.raw_dir.rglob("*.jpg")):
+            raise RuntimeError(f"{self.key}: Roboflow SDK reported success but {self.raw_dir} has no images")
 
     def iter_samples(self) -> Iterator[Sample]:
         for split in ("train", "valid", "test"):

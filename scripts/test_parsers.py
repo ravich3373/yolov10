@@ -13,7 +13,7 @@ from lpr.data.datasets.ccpd import parse_ccpd_filename  # noqa: E402
 from lpr.data.datasets.crpd import parse_crpd_label  # noqa: E402
 from lpr.data.datasets.openalpr import parse_openalpr_line  # noqa: E402
 from lpr.data.datasets.uc3m_lp import parse_uc3m_json  # noqa: E402
-from lpr.data.datasets.kaggle_andrewmvd import parse_voc_xml  # noqa: E402
+from lpr.data.datasets.base import parse_voc_xml  # noqa: E402
 from lpr.data.datasets.roboflow_sets import roboflow_group_key  # noqa: E402
 from lpr.data.datasets.base import write_yolo_label, read_yolo_label  # noqa: E402
 
@@ -58,12 +58,15 @@ boxes, w, h = parse_uc3m_json(uc3m)
 check("uc3m: poly -> bbox min/max", boxes == [(98, 200, 510, 300)])
 check("uc3m: size from json", (w, h) == (5184, 3888))
 
-# VOC XML (andrewmvd)
-voc = """<annotation><object><name>licence</name>
+# VOC XML — returns (name, box) pairs; IR-LPR style mixes plate + character boxes
+voc = """<annotation><object><name>کل ناحیه پلاک</name>
 <bndbox><xmin>226</xmin><ymin>125</ymin><xmax>419</xmax><ymax>173</ymax></bndbox></object>
-<object><name>licence</name>
-<bndbox><xmin>250</xmin><ymin>142</ymin><xmax>400</xmax><ymax>150</ymax></bndbox></object></annotation>"""
-check("voc: two boxes, first correct", parse_voc_xml(voc)[0] == (226.0, 125.0, 419.0, 173.0))
+<object><name>4</name>
+<bndbox><xmin>250</xmin><ymin>142</ymin><xmax>260</xmax><ymax>170</ymax></bndbox></object></annotation>"""
+objs = parse_voc_xml(voc)
+check("voc: two objects with names", len(objs) == 2 and objs[0][1] == (226.0, 125.0, 419.0, 173.0))
+plates = [b for n, b in objs if n == "کل ناحیه پلاک"]
+check("voc: plate-name filter drops character boxes (IR-LPR)", len(plates) == 1)
 
 # Roboflow group keys: strip export mangling so copies share a group
 check("roboflow: strips .rf hash + _jpg", roboflow_group_key("scan0001_jpg.rf.0a1b2c3d") == "scan0001")
