@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterator
 
-from .base import LprDataset, Sample, extract, gdown_file
+from .base import LprDataset, Sample, gdown_archives
 
 # Small archive first: when the big file is quota-blocked (Drive's shared download
 # quota, common for CCPD2019), the retry only has to fetch what's missing.
@@ -47,9 +47,7 @@ class CCPD(LprDataset):
     license_tier = "clean"  # MIT (LICENSE file, README, and the ECCV'18 paper all agree)
 
     def download(self) -> None:
-        for name, file_id in GDRIVE.items():
-            archive = gdown_file(file_id, self.raw_dir / name)
-            extract(archive, self.raw_dir)
+        gdown_archives(GDRIVE, self.raw_dir)
 
     def iter_samples(self) -> Iterator[Sample]:
         for img in sorted(self.raw_dir.rglob("*.jpg")):

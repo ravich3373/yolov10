@@ -35,15 +35,23 @@ def main():
         if key not in DATASETS:
             sys.exit(f"unknown dataset '{key}' — choices: {', '.join(DATASETS)}")
 
+    failed = []
     for key in keys:
         print(f"\n=== {key} ===")
         ds = DATASETS[key](args.root)
-        df = ds.build()
+        try:
+            df = ds.build()
+        except Exception as e:  # one dataset's quota wall shouldn't block the others
+            print(f"{key}: FAILED — {e}")
+            failed.append(key)
+            continue
         n_neg = (df["n_plates"] == 0).sum()
         print(
             f"{key}: {len(df):,} images, {df['n_plates'].sum():,} plates, {n_neg:,} negatives, "
             f"{df['group_key'].n_unique():,} groups -> {ds.manifest_path}"
         )
+    if failed:
+        sys.exit(f"\nincomplete: {failed} — re-run the same command later; already-banked archives are skipped")
 
 
 if __name__ == "__main__":

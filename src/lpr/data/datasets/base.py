@@ -173,6 +173,33 @@ def gdown_file(file_id: str, dest: Path) -> Path:
     return dest
 
 
+def gdown_archives(archives: dict[str, str], raw_dir: Path) -> None:
+    """Download + extract a set of Drive archives, banking whatever is available.
+
+    Popular datasets routinely have some archives behind Drive's shared download
+    quota ("Too many users...") while others fetch fine. Failing fast would waste
+    the available ones: instead every archive is attempted, completed downloads
+    and extractions are marked (so retries fetch ONLY the gaps), and the error at
+    the end lists exactly what is still missing."""
+    failed = []
+    for name, file_id in archives.items():
+        marker = raw_dir / f".extracted_{name}"
+        if marker.exists():
+            continue
+        try:
+            archive = gdown_file(file_id, raw_dir / name)
+            extract(archive, raw_dir)
+            marker.touch()
+        except Exception as e:
+            failed.append(name)
+            print(f"  [unavailable, will retry] {name}: {e}")
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)} archive(s) unavailable (likely Drive download quota, clears within ~24h): "
+            f"{failed} — everything else is banked; re-run the same command to fetch only what's missing"
+        )
+
+
 def download_url(url: str, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not dest.exists():

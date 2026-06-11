@@ -14,12 +14,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterator
 
-from .base import LprDataset, Sample, extract, gdown_file
+from .base import LprDataset, Sample, gdown_archives
 
+# smallest first: quota-walled big files shouldn't block banking the rest
 GDRIVE = {
-    "CRPD_single.zip": "1IBBHlg4VXXYSzq6TJR5S-6i_hTyh-6dD",  # ~14 GB
-    "CRPD_double.zip": "14zZ8FG0dnjzAO84Rl4v76GuhYN22bY4C",  # ~4.3 GB
     "CRPD_multi.zip": "1Ud1QB-y9kXCWf1J9pegpMUnW5wkPgvis",  # ~1.1 GB
+    "CRPD_double.zip": "14zZ8FG0dnjzAO84Rl4v76GuhYN22bY4C",  # ~4.3 GB
+    "CRPD_single.zip": "1IBBHlg4VXXYSzq6TJR5S-6i_hTyh-6dD",  # ~14 GB
 }
 
 
@@ -41,9 +42,7 @@ class CRPD(LprDataset):
     license_tier = "research"  # no license at all; commercial-use question unanswered since 2022
 
     def download(self) -> None:
-        for name, file_id in GDRIVE.items():
-            archive = gdown_file(file_id, self.raw_dir / name)
-            extract(archive, self.raw_dir)
+        gdown_archives(GDRIVE, self.raw_dir)
 
     def iter_samples(self) -> Iterator[Sample]:
         for img in sorted(self.raw_dir.rglob("*.jpg")):
