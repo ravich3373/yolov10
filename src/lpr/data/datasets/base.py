@@ -167,13 +167,24 @@ def gdown_file(file_id: str, dest: Path) -> Path:
     a bare uc?id= URL parses on every version anyway."""
     import sys
 
+    import fcntl
+
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if not dest.exists():
-        # --continue: resume partial multi-GB downloads instead of restarting.
-        # NOTE: popular files hit Drive's shared download quota ("Too many users
-        # have viewed or downloaded this file recently") — nothing to fix locally,
-        # retry after some hours or pull a mirror.
-        run([sys.executable, "-m", "gdown", "--continue", f"https://drive.google.com/uc?id={file_id}", "-O", str(dest)])
+    # Exclusive per-file lock: two concurrent runs (user shell + background retry)
+    # both writing the same archive with --continue interleave bytes and corrupt it
+    # — happened with IR-LPR train (12.3GB written for an 8.9GB file). The loser
+    # fails FAST with a clear message instead of silently destroying the download.
+    with open(dest.parent / (dest.name + ".lock"), "w") as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(f"{dest.name}: another process is already downloading this archive — let it finish, then re-run") from None
+        if not dest.exists():
+            # --continue: resume partial multi-GB downloads instead of restarting.
+            # NOTE: popular files hit Drive's shared download quota ("Too many users
+            # have viewed or downloaded this file recently") — nothing to fix locally,
+            # retry after some hours or pull a mirror.
+            run([sys.executable, "-m", "gdown", "--continue", f"https://drive.google.com/uc?id={file_id}", "-O", str(dest)])
     return dest
 
 
