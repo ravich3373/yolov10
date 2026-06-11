@@ -86,6 +86,20 @@ def main():
     check("after training: COCO scores still bit-identical (one2one)", torch.equal(post_o2o["scores"][:, :80], base_o2o["scores"]))
     check("after training: plate channel actually changed", not torch.equal(post_o2o["scores"][:, 80], new_o2o["scores"][:, 80]))
 
+    # BN-stat immunity: model.train() + forward must not move a single buffer.
+    # This is what torch.onnx.export does internally during tracing (verified) —
+    # without the freeze_bn_stats guard it silently corrupts the frozen trunk.
+    bn = next(m for m in model.modules() if isinstance(m, torch.nn.BatchNorm2d))
+    mean_before = bn.running_mean.clone()
+    model.train()
+    with torch.no_grad():
+        model.forward_features(x)
+    model.eval()
+    check("BN stats immune to train()+forward (the onnx.export footgun)", torch.equal(bn.running_mean, mean_before))
+    with torch.inference_mode():
+        (guard_o2m, _) = branch_outputs(model, x)
+    check("COCO scores still bit-identical after train()+forward", torch.equal(guard_o2m["scores"][:, :80], base_o2m["scores"]))
+
     # fused export head == split head
     with torch.inference_mode():
         split_out = model(x)

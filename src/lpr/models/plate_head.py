@@ -29,13 +29,29 @@ Training notes
 from __future__ import annotations
 
 import math
+import types
 
 import torch
 import torch.nn as nn
+from torch.nn.modules.batchnorm import _BatchNorm
 
 from .yolov10 import YOLOv10, V10Detect
 
 PLATE_CLASS_NAME = "license_plate"
+
+
+def freeze_bn_stats(model: nn.Module) -> None:
+    """Make every BatchNorm immune to train() — its running stats can never update.
+
+    requires_grad=False does NOT protect BN buffers; anything that flips the model
+    into train mode and runs a forward silently corrupts them. This is not
+    hypothetical: torch.onnx.export does exactly that during tracing (verified —
+    it cost us a day of ONNX 'parity failures' that were really a poisoned
+    reference model). With this guard, train(True) is a no-op for BN modules."""
+    for m in model.modules():
+        if isinstance(m, _BatchNorm):
+            m.eval()
+            m.train = types.MethodType(lambda self, mode=True: self, m)
 
 
 class SplitFinalConv(nn.Module):
@@ -83,7 +99,8 @@ def add_plate_class(model: YOLOv10, num_new: int = 1, freeze: bool = True) -> li
     """
     head: V10Detect = model.head
     if freeze:
-        model.requires_grad_(False)
+        model.requires_grad_(False)  # params (conv weights, BN affine)
+        freeze_bn_stats(model)  # BN buffers (running stats) — see freeze_bn_stats
 
     trainable: list[nn.Parameter] = []
     for branch in (head.cv3, head.one2one_cv3):
