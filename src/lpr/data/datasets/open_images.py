@@ -22,26 +22,41 @@ class OpenImagesVRP(LprDataset):
 
     def download(self) -> None:
         try:
+            import fiftyone as fo
             import fiftyone.zoo as foz
         except ImportError as e:
             raise ImportError("pip install fiftyone (needed once, for the Open Images downloader)") from e
+        import shutil
+
         for split in ("train", "validation", "test"):
+            # A crashed earlier run leaves an empty dataset registered under this
+            # name in fiftyone's db; load_zoo_dataset would then return the stale
+            # zero-sample stub instead of importing. Drop it first — the image
+            # cache on disk (~/fiftyone) is kept, so this never re-downloads.
+            name = f"open-images-v7-{split}"
+            if name in fo.list_datasets():
+                fo.delete_dataset(name)
             # No dataset_dir kwarg: load_zoo_dataset forwards extra kwargs into its
             # importer which also receives dataset_dir internally -> "multiple values
-            # for keyword argument". The zoo cache lives in fiftyone's default dir
-            # (~/fiftyone); only the YOLO export below needs to be in our raw_dir.
+            # for keyword argument". The zoo cache lives in fiftyone's default dir.
             ds = foz.load_zoo_dataset(
                 "open-images-v7",
                 split=split,
                 classes=[CLASS_NAME],
                 label_types=["detections"],
             )
+            if len(ds) == 0:
+                raise RuntimeError(f"open_images_vrp: split '{split}' loaded 0 samples — zoo cache corrupt?")
+            out = self.raw_dir / f"yolo_{split}"
+            if out.exists():
+                shutil.rmtree(out)  # never merge into a stale export
             ds.export(
-                export_dir=str(self.raw_dir / f"yolo_{split}"),
-                dataset_type=__import__("fiftyone").types.YOLOv5Dataset,
+                export_dir=str(out),
+                dataset_type=fo.types.YOLOv5Dataset,
                 label_field="ground_truth",
                 classes=[CLASS_NAME],
             )
+            fo.delete_dataset(name)  # keep fiftyone's registry clean for the next run
 
     def iter_samples(self) -> Iterator[Sample]:
         from .base import read_yolo_label
