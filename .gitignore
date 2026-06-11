@@ -1,5 +1,8 @@
+# Anchored to repo root — unanchored `data/` also matches src/lpr/data/ (the
+# dataset package), which silently excluded it from the first three pushes.
+/data/
+/weights/
+/artifacts/
+/runs/
 __pycache__/
 *.pyc
-weights/
-data/
-runs/
