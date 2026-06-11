@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--close-mosaic", type=int, default=10, help="disable mosaic for last N epochs")
     ap.add_argument("--mosaic", type=float, default=1.0, help="mosaic probability")
     ap.add_argument("--no-ema", action="store_true")
+    ap.add_argument("--no-amp", action="store_true", help="disable bf16 autocast")
+    ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--out", default=str(REPO / "artifacts" / "plate_head.pt"))
     args = ap.parse_args()
 
@@ -60,6 +62,7 @@ def main():
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, lrf=args.lrf,
         warmup_epochs=args.warmup_epochs, cos_lr=args.cos_lr,
         close_mosaic=args.close_mosaic, use_ema=not args.no_ema,
+        amp=not args.no_amp, workers=args.workers,
     )
 
     if len(test_ds):
