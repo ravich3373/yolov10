@@ -89,7 +89,7 @@ corpus = pl.DataFrame(rows)
 
 ds = PlateDataset(corpus, root, "train", augment=False)
 t, b = ds[0]
-check("dataset eval path: tensor (3,640,640), values in [0,1]", t.shape == (3, 640, 640) and 0 <= t.min() and t.max() <= 1)
+check("dataset eval path: uint8 tensor (3,640,640)", t.shape == (3, 640, 640) and t.dtype == torch.uint8)
 # letterbox 640x480 -> scale 1.0, pad y=80: box shifts to (100,200,260,250)
 check("dataset eval path: letterbox box math exact", torch.allclose(b[0], torch.tensor([100.0, 200.0, 260.0, 250.0])))
 
