@@ -18,6 +18,7 @@ COCO channels appear in no loss term and their convs are frozen: they cannot mov
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from .augment import DEFAULT_HYP, hsv_augment, mosaic4, random_affine
 from .models.yolov10 import YOLOv10, dist2bbox, make_anchors
 
 PLATE_CLASS = 80  # index of the grafted class
@@ -50,18 +52,34 @@ def letterbox(img: np.ndarray, size: int = 640) -> tuple[np.ndarray, float, tupl
 
 
 class PlateDataset(Dataset):
-    """Reads (image, plate boxes) pairs from a corpus manifest for one split."""
+    """(image, plate boxes) pairs from a corpus manifest, with the ultralytics
+    train-time augmentation recipe: mosaic -> random affine -> HSV -> flip.
+    Eval (augment=False) is letterbox only."""
 
-    def __init__(self, corpus: pl.DataFrame, data_root: Path, split: str, img_size: int = 640, augment: bool = False):
+    def __init__(
+        self,
+        corpus: pl.DataFrame,
+        data_root: Path,
+        split: str,
+        img_size: int = 640,
+        augment: bool = False,
+        hyp: dict | None = None,
+    ):
         self.rows = corpus.filter(pl.col("split") == split).select("image_path", "label_path", "width", "height").to_dicts()
         self.data_root = Path(data_root)
         self.img_size = img_size
         self.augment = augment
+        self.hyp = {**DEFAULT_HYP, **(hyp or {})}
+        self.mosaic_enabled = augment and self.hyp["mosaic"] > 0
+
+    def disable_mosaic(self):
+        """close_mosaic: trainer calls this for the final epochs."""
+        self.mosaic_enabled = False
 
     def __len__(self):
         return len(self.rows)
 
-    def __getitem__(self, i):
+    def _load(self, i) -> tuple[np.ndarray, np.ndarray]:
         import cv2
 
         from .data.datasets.base import read_yolo_label
@@ -69,13 +87,32 @@ class PlateDataset(Dataset):
         r = self.rows[i]
         img = cv2.cvtColor(cv2.imread(str(self.data_root / r["image_path"])), cv2.COLOR_BGR2RGB)
         boxes = np.array(read_yolo_label(self.data_root / r["label_path"], r["width"], r["height"]), dtype=np.float32).reshape(-1, 4)
-        img, s, (px, py) = letterbox(img, self.img_size)
-        boxes = boxes * s + np.array([px, py, px, py], dtype=np.float32)
-        if self.augment and np.random.rand() < 0.5:  # horizontal flip is the one safe, free aug
-            img = np.ascontiguousarray(img[:, ::-1])
-            boxes[:, [0, 2]] = self.img_size - boxes[:, [2, 0]]
-        t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        return t, torch.from_numpy(boxes)
+        return img, boxes
+
+    def __getitem__(self, i):
+        hyp, size = self.hyp, self.img_size
+        if self.mosaic_enabled and np.random.rand() < hyp["mosaic"]:
+            idxs = [i, *np.random.randint(0, len(self), 3)]
+            img, boxes = mosaic4([self._load(j) for j in idxs], size)
+            # border=-size/2 crops the 2x mosaic canvas back to train size
+            img, boxes = random_affine(
+                img, boxes, hyp["degrees"], hyp["translate"], hyp["scale"], hyp["shear"], border=(-size // 2, -size // 2)
+            )
+        else:
+            img, boxes = self._load(i)
+            img, s, (px, py) = letterbox(img, size)
+            if len(boxes):
+                boxes = boxes * s + np.array([px, py, px, py], dtype=np.float32)
+            if self.augment:  # close_mosaic phase keeps affine/HSV/flip, like ultralytics
+                img, boxes = random_affine(img, boxes, hyp["degrees"], hyp["translate"], hyp["scale"], hyp["shear"])
+        if self.augment:
+            img = hsv_augment(img, hyp["hsv_h"], hyp["hsv_s"], hyp["hsv_v"])
+            if np.random.rand() < hyp["fliplr"]:
+                img = np.ascontiguousarray(img[:, ::-1])
+                if len(boxes):
+                    boxes[:, [0, 2]] = size - boxes[:, [2, 0]]
+        t = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1).float() / 255.0
+        return t, torch.from_numpy(boxes.reshape(-1, 4))
 
 
 def collate(batch):
@@ -224,6 +261,33 @@ def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: flo
 # ---------------------------------------------------------------------------
 
 
+class EMA:
+    """Exponential moving average of the trainable params only (the frozen ones
+    can't move, so this equals full-model EMA at a fraction of the cost).
+    Ultralytics ramp: decay_eff = decay * (1 - exp(-updates / tau))."""
+
+    def __init__(self, params: list[torch.nn.Parameter], decay: float = 0.9999, tau: float = 2000.0):
+        self.params = params
+        self.shadow = [p.detach().clone() for p in params]
+        self.decay, self.tau, self.updates = decay, tau, 0
+
+    @torch.no_grad()
+    def update(self):
+        self.updates += 1
+        d = self.decay * (1 - math.exp(-self.updates / self.tau))
+        for s, p in zip(self.shadow, self.params):
+            s.mul_(d).add_(p.detach(), alpha=1 - d)
+
+    @torch.no_grad()
+    def swap(self):
+        """Exchange live params <-> shadow. Call once to eval/save with EMA weights,
+        call again to resume training from the live weights."""
+        for s, p in zip(self.shadow, self.params):
+            tmp = p.detach().clone()
+            p.copy_(s)
+            s.copy_(tmp)
+
+
 def train_plate(
     model: YOLOv10,
     trainable: list[torch.nn.Parameter],
@@ -232,30 +296,58 @@ def train_plate(
     epochs: int = 10,
     batch_size: int = 16,
     lr: float = 5e-3,
+    lrf: float = 0.01,  # final lr fraction (ultralytics default)
+    warmup_epochs: float = 3.0,
+    cos_lr: bool = False,  # linear decay by default, like ultralytics
+    close_mosaic: int = 10,  # mosaic off for the last N epochs
+    use_ema: bool = True,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     workers: int = 4,
 ) -> list[dict]:
     model = model.to(device).eval()  # eval() ALWAYS: frozen BN stats; new convs don't care
     opt = torch.optim.AdamW(trainable, lr=lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
+    ema = EMA(trainable) if use_ema else None
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate, num_workers=workers, drop_last=len(train_ds) > batch_size)
     val_loader = DataLoader(val_ds, batch_size=batch_size, collate_fn=collate, num_workers=workers) if val_ds else None
 
-    history = []
+    # schedule: per-epoch decay to lr*lrf (linear or cosine) + per-iter linear warmup
+    if cos_lr:
+        lf = lambda e: ((1 - math.cos(e * math.pi / epochs)) / 2) * (lrf - 1) + 1  # noqa: E731
+    else:
+        lf = lambda e: max(1 - e / epochs, 0) * (1 - lrf) + lrf  # noqa: E731
+    nb = max(len(train_loader), 1)
+    nw = max(round(warmup_epochs * nb), 100) if warmup_epochs > 0 else 0
+
+    history, ni = [], 0
     for epoch in range(epochs):
+        # exactly ultralytics semantics: if close_mosaic >= epochs, mosaic never turns off
+        if close_mosaic and epoch == epochs - close_mosaic and hasattr(train_ds, "disable_mosaic"):
+            train_ds.disable_mosaic()
+            print(f"  epoch {epoch}: mosaic disabled (close_mosaic={close_mosaic})")
         losses = []
         for imgs, gts in train_loader:
+            warm = min(ni / nw, 1.0) if nw else 1.0
+            for g in opt.param_groups:
+                g["lr"] = lr * lf(epoch) * warm
             loss, _ = plate_loss(model, imgs.to(device), gts)
             opt.zero_grad()
             loss.backward()
             opt.step()
+            if ema:
+                ema.update()
             losses.append(loss.item())
-        sched.step()
-        entry = {"epoch": epoch, "loss": float(np.mean(losses))}
+            ni += 1
+        entry = {"epoch": epoch, "loss": float(np.mean(losses)), "lr": opt.param_groups[0]["lr"]}
         if val_loader is not None:
+            if ema:
+                ema.swap()  # evaluate with EMA weights
             entry |= evaluate_ap50(model, val_loader, device)
+            if ema:
+                ema.swap()
         history.append(entry)
         print("  " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in entry.items()))
+    if ema:
+        ema.swap()  # leave the EMA weights in the model (what gets saved/exported)
     return history
 
 

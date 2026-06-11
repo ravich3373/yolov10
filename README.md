@@ -47,7 +47,8 @@ Key data rules (each one traces to a verified problem — see datasets.md):
 | `scripts/verify_plate_surgery.py` | surgery leaves COCO bit-identical; 12 trainable tensors; fused export head identical |
 | `scripts/test_parsers.py` | every annotation parser against real-format fixtures |
 | `scripts/test_dedup_split.py` | dedup clusters exact/near copies; split invariants; leakage purge |
-| `scripts/test_train_smoke.py` | full training loop on synthetic plates: AP50 0→0.82, COCO bit-identical after |
+| `scripts/test_augment.py` | mosaic/affine/HSV/EMA invariants + dataset pipeline |
+| `scripts/test_train_smoke.py` | full training loop on synthetic plates: AP50 0→0.88, COCO bit-identical after |
 
 ## Layout
 
@@ -58,7 +59,8 @@ src/lpr/data/datasets/        one module per dataset (download + parser)
 src/lpr/data/manifest.py      manifest schema
 src/lpr/dedup.py              pHash + Hamming clustering (GPU-accelerated)
 src/lpr/split.py              group-aware splits + leakage purge
-src/lpr/train.py              TAL assignment + plate-channel loss + AP50 eval
+src/lpr/augment.py            ultralytics train recipe: mosaic, affine, HSV, flip
+src/lpr/train.py              TAL assignment + plate-channel loss + schedules/EMA + AP50 eval
 ```
 
 ## Status / TODO

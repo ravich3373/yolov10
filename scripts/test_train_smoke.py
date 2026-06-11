@@ -105,7 +105,10 @@ def main():
     model = model.to(device)
     ap_before = evaluate_ap50(model, val_loader, device)["ap50"]
 
-    history = train_plate(model, trainable, train_ds, val_ds, epochs=8, batch_size=8, lr=1e-2, device=device, workers=2)
+    # warmup_epochs=0: the run is ~100 iters total, the default 3-epoch warmup would
+    # never finish ramping. close_mosaic=2: 6 epochs WITH mosaic, then 2 letterboxed —
+    # exercises both train paths and the switch itself.
+    history = train_plate(model, trainable, train_ds, val_ds, epochs=8, batch_size=8, lr=1e-2, warmup_epochs=0, close_mosaic=2, device=device, workers=2)
     ap_after = history[-1]["ap50"]
 
     check(f"loss decreased ({history[0]['loss']:.3f} -> {history[-1]['loss']:.3f})", history[-1]["loss"] < 0.5 * history[0]["loss"])

@@ -34,11 +34,17 @@ def main():
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=5e-3)
+    ap.add_argument("--lrf", type=float, default=0.01, help="final lr fraction")
+    ap.add_argument("--warmup-epochs", type=float, default=3.0)
+    ap.add_argument("--cos-lr", action="store_true", help="cosine decay (default linear)")
+    ap.add_argument("--close-mosaic", type=int, default=10, help="disable mosaic for last N epochs")
+    ap.add_argument("--mosaic", type=float, default=1.0, help="mosaic probability")
+    ap.add_argument("--no-ema", action="store_true")
     ap.add_argument("--out", default=str(REPO / "artifacts" / "plate_head.pt"))
     args = ap.parse_args()
 
     corpus = pl.read_parquet(args.corpus)
-    train_ds = PlateDataset(corpus, args.root, "train", augment=True)
+    train_ds = PlateDataset(corpus, args.root, "train", augment=True, hyp={"mosaic": args.mosaic})
     val_ds = PlateDataset(corpus, args.root, "val")
     test_ds = PlateDataset(corpus, args.root, "test")
     print(f"train {len(train_ds):,} | val {len(val_ds):,} | test {len(test_ds):,}")
@@ -49,7 +55,12 @@ def main():
     trainable = add_plate_class(model)
     print(f"trainable: {sum(p.numel() for p in trainable)} params (of {sum(p.numel() for p in model.parameters()):,})")
 
-    history = train_plate(model, trainable, train_ds, val_ds or None, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+    history = train_plate(
+        model, trainable, train_ds, val_ds or None,
+        epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, lrf=args.lrf,
+        warmup_epochs=args.warmup_epochs, cos_lr=args.cos_lr,
+        close_mosaic=args.close_mosaic, use_ema=not args.no_ema,
+    )
 
     if len(test_ds):
         device = next(model.parameters()).device
