@@ -26,12 +26,15 @@ class OpenImagesVRP(LprDataset):
         except ImportError as e:
             raise ImportError("pip install fiftyone (needed once, for the Open Images downloader)") from e
         for split in ("train", "validation", "test"):
+            # No dataset_dir kwarg: load_zoo_dataset forwards extra kwargs into its
+            # importer which also receives dataset_dir internally -> "multiple values
+            # for keyword argument". The zoo cache lives in fiftyone's default dir
+            # (~/fiftyone); only the YOLO export below needs to be in our raw_dir.
             ds = foz.load_zoo_dataset(
                 "open-images-v7",
                 split=split,
                 classes=[CLASS_NAME],
                 label_types=["detections"],
-                dataset_dir=str(self.raw_dir),
             )
             ds.export(
                 export_dir=str(self.raw_dir / f"yolo_{split}"),

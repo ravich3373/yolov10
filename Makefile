@@ -11,6 +11,13 @@
 # python from the lpr conda env if present, else whatever is on PATH
 PY ?= $(shell test -x $(HOME)/miniconda3/envs/lpr/bin/python && echo $(HOME)/miniconda3/envs/lpr/bin/python || echo python3)
 
+# every data/train run is tee'd to a timestamped log under data/logs/
+SHELL := /bin/bash
+LOGDIR := data/logs
+define LOGGED
+mkdir -p $(LOGDIR) && set -o pipefail && ($(1)) 2>&1 | tee $(LOGDIR)/$(2)-$$(date +%Y%m%d-%H%M%S).log
+endef
+
 VARIANT      ?= s
 DATASETS     ?= openalpr
 EPOCHS       ?= 20
@@ -38,17 +45,17 @@ weights/yolov10%.pt:
 	curl -L --fail -o $@ https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov10$*.pt
 
 data: ## download + convert DATASETS (default: openalpr). e.g. make data DATASETS="ccpd crpd"
-	$(PY) scripts/build_datasets.py $(DATASETS)
+	$(call LOGGED,$(PY) scripts/build_datasets.py $(DATASETS),data)
 
 data-all: ## everything in the registry (CCPD ~13GB, CRPD ~19GB; needs API keys for some)
-	$(PY) scripts/build_datasets.py all
+	$(call LOGGED,$(PY) scripts/build_datasets.py all,data)
 
 prep: ## pHash dedup + splits + leakage purge -> data/corpus.parquet
-	$(PY) scripts/dedup_and_split.py --radius $(RADIUS) --seed $(SEED)
+	$(call LOGGED,$(PY) scripts/dedup_and_split.py --radius $(RADIUS) --seed $(SEED),prep)
 
 train: weights ## train plate head (frozen trunk) -> artifacts/plate_head.pt
-	$(PY) scripts/train_plate.py --variant $(VARIANT) --weights weights/yolov10$(VARIANT).pt \
-	    --epochs $(EPOCHS) --batch-size $(BATCH) --lr $(LR)
+	$(call LOGGED,$(PY) scripts/train_plate.py --variant $(VARIANT) --weights weights/yolov10$(VARIANT).pt \
+	    --epochs $(EPOCHS) --batch-size $(BATCH) --lr $(LR),train)
 
 test: weights ## full verification suite (parity, surgery, parsers, dedup/split, augment, training)
 	$(PY) scripts/verify_yolov10_parity.py $(VARIANT)
