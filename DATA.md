@@ -48,11 +48,11 @@ make data-all                      # everything registered (needs ALL prereqs ab
 | ccpd | ~366k | `make data DATASETS=ccpd` | ⚠️ partial: CCPD2020 (11,776 green-plate imgs) banked; **CCPD2019 (13 GB) pending** | Drive download quota; auto-retry armed |
 | crpd | ~33.5k | `make data DATASETS=crpd` | ⚠️ partial: multi (1,585) + double (~6k) banked; **single (14 GB, ~26k) pending** | Drive download quota; auto-retry armed |
 | uc3m_lp | 1,975 | `make data DATASETS=uc3m_lp` | ⬜ not started | none — direct Zenodo URL (4.55 GB) |
-| rxg4e | 10,125 | `pip install roboflow`, set `ROBOFLOW_API_KEY`, `make data DATASETS=rxg4e` | ⬜ not started | needs free Roboflow account/API key |
-| lhqow | 462 | same as rxg4e | ⬜ not started | needs Roboflow API key |
+| rxg4e | 10,125 | `pip install roboflow`, set `ROBOFLOW_API_KEY`, `make data DATASETS=rxg4e` | ⬜ re-run needed | first attempt hit an SDK silent-skip bug (fixed); re-run **with the key exported** |
+| lhqow | 462 | same as rxg4e | ⬜ re-run needed | same as rxg4e |
 | open_images_vrp | 8,157 | `pip install fiftyone`, `make data DATASETS=open_images_vrp` | ⬜ not started | needs fiftyone (heavy dep, installs mongodb) |
 | kaggle_andrewmvd | 433 | kaggle CLI + `~/.kaggle/kaggle.json`, `make data DATASETS=kaggle_andrewmvd` | ⬜ not started | needs Kaggle credentials |
-| ir_lpr | ~21k | manual for now — see below | ⬜ blocked | Drive file ids not pinned yet (TODO) |
+| ir_lpr | ~21k | `make data DATASETS=ir_lpr` | ⏳ downloading (val banked; train+test in flight) | — |
 | CLPD | 1,200 | not in registry | ❌ skipped | BaiduYun-only (needs CN-phone account); eval-only design anyway |
 
 Manifests land in `data/processed/<key>/manifest.parquet`; only **complete** datasets
@@ -112,12 +112,13 @@ FiftyOne zoo downloads just the "Vehicle registration plate" class (8,157 imgs /
 `kaggle datasets download andrewmvd/car-plate-detection` under the hood. Needs
 `~/.kaggle/kaggle.json` (kaggle.com → Account → Create API token).
 
-### ir_lpr (TODO)
-~21k Iranian images incl. 4,122 night — the only sizeable free night set. The repo
-(github.com/mut-deep/IR-LPR) links several Drive archives whose exact ids/layout we
-haven't pinned; download manually into `data/raw/ir_lpr/` and the parser will
-auto-discover YOLO image/label pairs, or pin the ids in
-`src/lpr/data/datasets/ir_lpr.py`.
+### ir_lpr
+~21k Iranian images incl. ~4.1k night — the only sizeable free night set. Scripted:
+the three "Car Image" Drive archives (the "License Plate" archives are OCR crops —
+skipped). Format gotcha handled in the parser: each VOC XML holds the plate box
+(named "کل ناحیه پلاک") plus one box per character — filtered by name, otherwise
+every digit would become a plate label. `day_`/`night_` filename prefixes are
+recorded as the `subset` column (use for night oversampling).
 
 ## After data completes
 
