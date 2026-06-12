@@ -341,7 +341,7 @@ def load_plate_t1(model, path: Path) -> dict:
 
 
 @torch.inference_mode()
-def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: float = 1e-3) -> dict:
+def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: float = 1e-3, return_pr: bool = False) -> dict:
     scored, n_gt = [], 0  # scored: (conf, is_true_positive)
     for imgs, gts in tqdm(loader, desc="  eval", unit="b", leave=False, mininterval=2, dynamic_ncols=True):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
@@ -365,17 +365,21 @@ def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: flo
                 else:
                     scored.append((row[4].item(), False))
     if not scored or n_gt == 0:
-        return {"ap50": 0.0, "recall": 0.0, "n_gt": n_gt}
+        return {"ap50": 0.0, "recall": 0.0, "n_gt": n_gt, **({"pr": ([], [])} if return_pr else {})}
     scored.sort(key=lambda x: -x[0])
     tp = np.cumsum([s[1] for s in scored])
     precision = tp / np.arange(1, len(scored) + 1)
     recall = tp / n_gt
+    p_interp = np.maximum.accumulate(precision[::-1])[::-1]
     # all-point interpolated AP
     ap, prev_r = 0.0, 0.0
-    for r, p in zip(recall, np.maximum.accumulate(precision[::-1])[::-1]):
+    for r, p in zip(recall, p_interp):
         ap += (r - prev_r) * p
         prev_r = r
-    return {"ap50": float(ap), "recall": float(recall[-1]), "n_gt": n_gt}
+    out = {"ap50": float(ap), "recall": float(recall[-1]), "n_gt": n_gt}
+    if return_pr:
+        out["pr"] = (recall.tolist(), p_interp.tolist())
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +431,8 @@ def train_plate(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     workers: int = 16,
     loss_fn=plate_loss,  # plate_loss (Tier 0) or plate_t1_loss (Tier 1)
+    tracker=None,  # ExperimentTracker: per-epoch metrics, tensorboard, ckpts
+    save_fn=None,  # save_plate_head / save_plate_t1 — used for last.pt/best.pt
 ) -> list[dict]:
     # train() is SAFE for the frozen parts: their BatchNorms carry the
     # freeze_bn_stats guard (train() is a no-op on them). Tier 1's own head has
@@ -454,13 +460,16 @@ def train_plate(
     nb = max(len(train_loader), 1)
     nw = max(round(warmup_epochs * nb), 100) if warmup_epochs > 0 else 0
 
+    import time
+
     history, ni = [], 0
     for epoch in range(epochs):
+        t0 = time.time()
         # exactly ultralytics semantics: if close_mosaic >= epochs, mosaic never turns off
         if close_mosaic and epoch == epochs - close_mosaic and hasattr(train_ds, "disable_mosaic"):
             train_ds.disable_mosaic()
             print(f"  epoch {epoch}: mosaic disabled (close_mosaic={close_mosaic})")
-        losses = []
+        losses, branch_losses = [], {"o2m": [], "o2o": []}
         pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}", unit="b", mininterval=2, dynamic_ncols=True)
         for imgs, gts in pbar:
             warm = min(ni / nw, 1.0) if nw else 1.0
@@ -473,6 +482,8 @@ def train_plate(
             if ema:
                 ema.update()
             losses.append(loss.item())
+            for k in branch_losses:
+                branch_losses[k].append(stats[k])
             ni += 1
             pbar.set_postfix(
                 loss=f"{np.mean(losses):.3f}",
@@ -481,17 +492,29 @@ def train_plate(
                 lr=f"{opt.param_groups[0]['lr']:.1e}",
                 refresh=False,
             )
-        entry = {"epoch": epoch, "loss": float(np.mean(losses)), "lr": opt.param_groups[0]["lr"]}
+        entry = {
+            "epoch": epoch,
+            "loss": float(np.mean(losses)),
+            "o2m": float(np.mean(branch_losses["o2m"])),
+            "o2o": float(np.mean(branch_losses["o2o"])),
+            "lr": opt.param_groups[0]["lr"],
+            "time": round(time.time() - t0, 1),
+        }
+        model.eval()
+        if ema:
+            ema.swap()  # evaluate AND checkpoint with EMA weights
         if val_loader is not None:
-            model.eval()
-            if ema:
-                ema.swap()  # evaluate with EMA weights
             entry |= evaluate_ap50(model, val_loader, device)
-            if ema:
-                ema.swap()
-            model.train()
+        if tracker is not None and save_fn is not None:
+            tracker.save_checkpoint(model, save_fn, entry)
+        if ema:
+            ema.swap()
+        model.train()
         history.append(entry)
-        print("  " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in entry.items()))
+        if tracker is not None:
+            tracker.log_epoch(entry)
+        else:
+            print("  " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in entry.items()))
     if ema:
         ema.swap()  # leave the EMA weights in the model (what gets saved/exported)
     model.eval()
