@@ -161,14 +161,16 @@ def assign_targets(
     alpha: float = 0.5,
     beta: float = 6.0,
 ) -> torch.Tensor:
-    """-> (B, A) soft target score per anchor (0 for background). YOLOv8 TAL
+    """-> (target_scores (B,A), target_boxes (B,A,4), fg_mask (B,A)). YOLOv8 TAL
     semantics, fully batched — a per-image Python loop costs ~B sequential GPU
-    launches per step and dominated the step time at real batch sizes."""
+    launches per step and dominated the step time at real batch sizes.
+    target_boxes/fg_mask feed the Tier-1 box+DFL losses; Tier 0 ignores them."""
     B, A = plate_prob.shape
     device = plate_prob.device
     N = max((len(g) for g in gt_list), default=0)
     if N == 0:
-        return torch.zeros(B, A, device=device)
+        z = torch.zeros(B, A, device=device)
+        return z, torch.zeros(B, A, 4, device=device), z.bool()
     gt = torch.zeros(B, N, 4, device=device)
     valid = torch.zeros(B, N, dtype=torch.bool, device=device)
     for b, g in enumerate(gt_list):
@@ -209,7 +211,12 @@ def assign_targets(
     align = align * mask
     pos_align = align.amax(1, keepdim=True)  # (B, 1, N) best alignment per gt
     pos_iou = (iou * mask).amax(1, keepdim=True)  # (B, 1, N) best IoU per gt
-    return (align * pos_iou / (pos_align + 1e-9)).amax(-1)  # (B, A)
+    target_scores = (align * pos_iou / (pos_align + 1e-9)).amax(-1)  # (B, A)
+
+    fg = mask.any(-1)  # (B, A)
+    gt_idx = mask.float().argmax(-1)  # (B, A) assigned gt per anchor (junk where !fg)
+    target_boxes = gt.gather(1, gt_idx.unsqueeze(-1).expand(-1, -1, 4))
+    return target_scores, target_boxes, fg
 
 
 # ---------------------------------------------------------------------------
@@ -239,11 +246,93 @@ def plate_loss(
         with torch.no_grad():  # frozen box branch: assignment only
             dist = h.dfl(branch["boxes"].float())  # (B, 4, A)
             boxes = (dist2bbox(dist, anchors.T.unsqueeze(0), xywh=False, dim=1) * strides.T).permute(0, 2, 1)
-            targets = assign_targets(logits.detach().sigmoid(), boxes, anchor_xy, gts, topk)  # (B, A)
+            targets, _, _ = assign_targets(logits.detach().sigmoid(), boxes, anchor_xy, gts, topk)  # (B, A)
         loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="sum") / max(targets.sum().item(), 1.0)
         total = total + loss
         stats[name] = loss.item()
     return total, stats
+
+
+def ciou(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Complete IoU between paired boxes (n,4) xyxy -> (n,). IoU minus center
+    distance (normalized by enclosing-box diagonal) minus aspect-ratio term."""
+    inter = (torch.minimum(a[:, 2:], b[:, 2:]) - torch.maximum(a[:, :2], b[:, :2])).clamp(min=0).prod(-1)
+    wa, ha = a[:, 2] - a[:, 0], a[:, 3] - a[:, 1]
+    wb, hb = b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]
+    union = wa * ha + wb * hb - inter + 1e-9
+    iou = inter / union
+    cw = torch.maximum(a[:, 2], b[:, 2]) - torch.minimum(a[:, 0], b[:, 0])  # enclosing box
+    chh = torch.maximum(a[:, 3], b[:, 3]) - torch.minimum(a[:, 1], b[:, 1])
+    c2 = cw.pow(2) + chh.pow(2) + 1e-9
+    rho2 = ((a[:, 0] + a[:, 2] - b[:, 0] - b[:, 2]).pow(2) + (a[:, 1] + a[:, 3] - b[:, 1] - b[:, 3]).pow(2)) / 4
+    v = (4 / math.pi**2) * (torch.atan(wb / (hb + 1e-9)) - torch.atan(wa / (ha + 1e-9))).pow(2)
+    with torch.no_grad():
+        alpha = v / (v - iou + 1 + 1e-9)
+    return iou - rho2 / c2 - alpha * v
+
+
+def dfl_loss(dist_logits: torch.Tensor, target: torch.Tensor, reg_max: int = 16) -> torch.Tensor:
+    """Distribution Focal Loss: (n,4,reg_max) logits vs (n,4) continuous distances
+    in [0, reg_max-1] -> (n,). CE against the two adjacent bins, linearly weighted."""
+    tl = target.floor().long()
+    tr = (tl + 1).clamp(max=reg_max - 1)
+    wl = tr.float() - target
+    wr = 1 - wl
+    logits = dist_logits.reshape(-1, reg_max)
+    ce_l = F.cross_entropy(logits, tl.reshape(-1), reduction="none")
+    ce_r = F.cross_entropy(logits, tr.reshape(-1), reduction="none")
+    return (ce_l * wl.reshape(-1) + ce_r * wr.reshape(-1)).view(-1, 4).mean(-1)
+
+
+def plate_t1_loss(
+    model, imgs: torch.Tensor, gt_boxes: list[torch.Tensor], amp: bool = True
+) -> tuple[torch.Tensor, dict]:
+    """Full v8-style detection loss for the Tier-1 plate head (cls BCE + CIoU box
+    + DFL, ultralytics gains 0.5/7.5/1.5), one2many topk=10 + one2one topk=1.
+    Only the plate head has gradients; the trunk and COCO head are frozen."""
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp and imgs.is_cuda):
+        out = model(imgs)  # training dict: feats + both branches
+    ph = model.plate_head
+    anchors, strides = make_anchors([f.float() for f in out["feats"]], ph.stride, 0.5)
+    anchor_xy = anchors * strides
+    gts = [g.to(imgs.device, non_blocking=True) for g in gt_boxes]
+
+    total, stats = 0.0, {}
+    for name, topk in (("o2m", 10), ("o2o", 1)):
+        branch = out[name]
+        logits = branch["scores"][:, 0].float()  # (B, A) — single class
+        raw = branch["boxes"].float()  # (B, 64, A)
+        boxes = (dist2bbox(ph.dfl(raw), anchors.T.unsqueeze(0), xywh=False, dim=1) * strides.T).permute(0, 2, 1)
+        with torch.no_grad():
+            targets, tboxes, fg = assign_targets(logits.detach().sigmoid(), boxes.detach(), anchor_xy, gts, topk)
+        t_sum = max(targets.sum().item(), 1.0)
+
+        loss_cls = F.binary_cross_entropy_with_logits(logits, targets, reduction="sum") / t_sum
+        loss_box = boxes.new_zeros(())
+        loss_dfl = boxes.new_zeros(())
+        if fg.any():
+            w = targets[fg]
+            loss_box = ((1.0 - ciou(boxes[fg], tboxes[fg])) * w).sum() / t_sum
+            # DFL targets are distances in FEATURE units (the 16 bins are cell counts)
+            ltrb = torch.cat([anchor_xy[None] - tboxes[..., :2], tboxes[..., 2:] - anchor_xy[None]], -1)
+            ltrb = (ltrb / strides.T.unsqueeze(-1).transpose(1, 2)).clamp(0, ph.reg_max - 1 - 0.01)
+            dist_logits = raw.view(raw.shape[0], 4, ph.reg_max, -1).permute(0, 3, 1, 2)  # (B,A,4,16)
+            loss_dfl = (dfl_loss(dist_logits[fg], ltrb[fg], ph.reg_max) * w).sum() / t_sum
+        total = total + 0.5 * loss_cls + 7.5 * loss_box + 1.5 * loss_dfl
+        stats[name] = (0.5 * loss_cls + 7.5 * loss_box + 1.5 * loss_dfl).item()
+    return total, stats
+
+
+def save_plate_t1(model, path: Path, meta: dict | None = None) -> None:
+    """Tier-1 checkpoint: the whole plate head (~6.5MB) — trunk stays the official file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"plate_head_t1": model.plate_head.state_dict(), "meta": meta or {}}, path)
+
+
+def load_plate_t1(model, path: Path) -> dict:
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    model.plate_head.load_state_dict(ckpt["plate_head_t1"])
+    return ckpt["meta"]
 
 
 # ---------------------------------------------------------------------------
@@ -337,8 +426,12 @@ def train_plate(
     amp: bool = True,  # bf16 autocast on the frozen forward
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     workers: int = 16,
+    loss_fn=plate_loss,  # plate_loss (Tier 0) or plate_t1_loss (Tier 1)
 ) -> list[dict]:
-    model = model.to(device).eval()  # eval() ALWAYS: frozen BN stats; new convs don't care
+    # train() is SAFE for the frozen parts: their BatchNorms carry the
+    # freeze_bn_stats guard (train() is a no-op on them). Tier 1's own head has
+    # live BNs that genuinely need train mode for their running stats.
+    model = model.to(device).train()
     opt = torch.optim.AdamW(trainable, lr=lr)
     ema = EMA(trainable) if use_ema else None
     loader_kw = dict(
@@ -373,7 +466,7 @@ def train_plate(
             warm = min(ni / nw, 1.0) if nw else 1.0
             for g in opt.param_groups:
                 g["lr"] = lr * lf(epoch) * warm
-            loss, stats = plate_loss(model, _to_device(imgs, device), gts, amp=amp)
+            loss, stats = loss_fn(model, _to_device(imgs, device), gts, amp=amp)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -390,15 +483,18 @@ def train_plate(
             )
         entry = {"epoch": epoch, "loss": float(np.mean(losses)), "lr": opt.param_groups[0]["lr"]}
         if val_loader is not None:
+            model.eval()
             if ema:
                 ema.swap()  # evaluate with EMA weights
             entry |= evaluate_ap50(model, val_loader, device)
             if ema:
                 ema.swap()
+            model.train()
         history.append(entry)
         print("  " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in entry.items()))
     if ema:
         ema.swap()  # leave the EMA weights in the model (what gets saved/exported)
+    model.eval()
     return history
 
 
