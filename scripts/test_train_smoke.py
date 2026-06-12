@@ -162,6 +162,18 @@ def main():
     manifest = _json.loads((run / "manifest.json").read_text())
     check("tracker: manifest has git commit + env", bool(manifest["git"]["commit"]) and manifest["env"]["torch"])
 
+    # ---------------- negative-flip metric ----------------
+    from lpr.flips import count_flips
+
+    untrained = YOLOv10.from_ultralytics_pt(str(weights), "s") if weights.exists() else YOLOv10("s").eval()
+    add_plate_class(untrained)
+    rep = count_flips(model, untrained.to(device), val_loader, device)
+    check(f"flips trained->untrained: NFR ~1 ({rep['overall']['nfr']})",
+          rep["overall"]["nfr"] > 0.9 and rep["overall"]["neg_flips"] > 30)
+    rep2 = count_flips(untrained, model, val_loader, device)
+    check("flips untrained->trained: all positive, zero negative",
+          rep2["overall"]["neg_flips"] == 0 and rep2["overall"]["pos_flips"] > 30)
+
     # ---------------- Tier 1: full parallel plate head ----------------
     print("\n--- tier 1 ---")
     base = YOLOv10.from_ultralytics_pt(str(weights), "s") if weights.exists() else YOLOv10("s").eval()
