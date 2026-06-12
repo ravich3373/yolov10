@@ -518,7 +518,12 @@ def train_plate(
             print(f"  epoch {epoch}: mosaic disabled (close_mosaic={close_mosaic})")
         losses, branch_losses = [], {"o2m": [], "o2o": []}
         pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}", unit="b", mininterval=2, dynamic_ncols=True)
-        for imgs, gts in pbar:
+        for bi, (imgs, gts) in enumerate(pbar):
+            # what the model ACTUALLY sees: first batches + the close_mosaic switch
+            if tracker is not None and bi < (3 if epoch == 0 else 0):
+                tracker.plot_train_batch(imgs, gts, bi)
+            if tracker is not None and bi == 0 and close_mosaic and epoch == epochs - close_mosaic:
+                tracker.plot_train_batch(imgs, gts, f"_e{epoch}_no_mosaic")
             target_lr = base_lr * lf(epoch)
             for j, g in enumerate(opt.param_groups):
                 if nw and ni < nw:

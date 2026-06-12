@@ -152,7 +152,8 @@ def main():
     tracker.finish({"notes": "smoke"})
     run = tracker.dir
     for f in ("config.json", "manifest.json", "log.txt", "results.csv", "history.json", "last.pt", "best.pt",
-              "analysis/results.png", "analysis/pr_curve.png", "analysis/val_preds.jpg"):
+              "analysis/results.png", "analysis/pr_curve.png", "analysis/val_preds.jpg",
+              "analysis/train_batch0.jpg", "analysis/train_batch2.jpg", "analysis/train_batch_e6_no_mosaic.jpg"):
         check(f"tracker artifact exists: {f}", (run / f).exists() and (run / f).stat().st_size > 0)
     check("tracker: tensorboard events written", any((run / "tb").glob("events.*")))
     check("tracker: results.csv has header + 8 epochs", len((run / "results.csv").read_text().splitlines()) == 9)
