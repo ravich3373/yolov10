@@ -115,6 +115,28 @@ class ExperimentTracker:
         fig.savefig(self.dir / "analysis" / "pr_curve.png", dpi=120)
         plt.close(fig)
 
+    def plot_train_batch(self, imgs, gt_list, tag, max_imgs: int = 16) -> None:
+        """Tile a TRAIN batch exactly as the model sees it (post mosaic/affine/HSV/
+        flip), GT boxes in green -> analysis/train_batch<tag>.jpg. The fastest way
+        to catch a broken box transform is to look at one of these."""
+        import cv2
+
+        cells = []
+        for i in range(min(len(imgs), max_imgs)):
+            img = imgs[i].permute(1, 2, 0).numpy().copy()  # uint8 RGB straight from the loader
+            for x1, y1, x2, y2 in gt_list[i].numpy().astype(int):
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cells.append(cv2.resize(img, (320, 320)))
+        if not cells:
+            return
+        cols = int(np.ceil(np.sqrt(len(cells))))
+        rows = int(np.ceil(len(cells) / cols))
+        grid = np.full((rows * 320, cols * 320, 3), 114, dtype=np.uint8)
+        for i, cell in enumerate(cells):
+            r, c = divmod(i, cols)
+            grid[r * 320 : (r + 1) * 320, c * 320 : (c + 1) * 320] = cell
+        cv2.imwrite(str(self.dir / "analysis" / f"train_batch{tag}.jpg"), cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
+
     def plot_val_predictions(self, model, dataset, device: str, n: int = 16, conf: float = 0.25) -> None:
         """Grid of val images: GT plates green, predictions red (with conf)."""
         import cv2
