@@ -426,20 +426,24 @@ class V10Detect(nn.Module):
         return self.postprocess(y.permute(0, 2, 1))
 
     def postprocess(self, preds):
-        """(B, A, 4+nc) -> (B, max_det, 6) [x1,y1,x2,y2,score,cls] by pure top-k.
-        gather-only indexing (no advanced indexing): the ONNX tracer mis-lowers
-        `t[arange(B)[:,None], idx]`, producing silently wrong exported graphs."""
-        boxes, scores = preds.split([4, self.nc], dim=-1)
-        batch, anchors, nc = scores.shape
-        k = min(self.max_det, anchors)
-        # top-k anchor points by their best class score...
-        ori_index = scores.max(dim=-1)[0].topk(k)[1]  # (B, k) anchor ids
-        scores = scores.gather(dim=1, index=ori_index.unsqueeze(-1).repeat(1, 1, nc))
-        # ...then top-k (anchor, class) pairs among those
-        scores, index = scores.flatten(1).topk(k)  # index in [0, k*nc)
-        anchor_of = ori_index.gather(1, index // nc)  # (B, k) back to anchor ids
-        boxes = boxes.gather(dim=1, index=anchor_of.unsqueeze(-1).repeat(1, 1, 4))
-        return torch.cat([boxes, scores[..., None], (index % nc)[..., None].float()], dim=-1)
+        return topk_detections(preds, self.nc, self.max_det)
+
+
+def topk_detections(preds, nc: int, max_det: int):
+    """(B, A, 4+nc) -> (B, max_det, 6) [x1,y1,x2,y2,score,cls] by pure top-k.
+    gather-only indexing (no advanced indexing): the ONNX tracer mis-lowers
+    `t[arange(B)[:,None], idx]`, producing silently wrong exported graphs."""
+    boxes, scores = preds.split([4, nc], dim=-1)
+    batch, anchors, nc = scores.shape
+    k = min(max_det, anchors)
+    # top-k anchor points by their best class score...
+    ori_index = scores.max(dim=-1)[0].topk(k)[1]  # (B, k) anchor ids
+    scores = scores.gather(dim=1, index=ori_index.unsqueeze(-1).repeat(1, 1, nc))
+    # ...then top-k (anchor, class) pairs among those
+    scores, index = scores.flatten(1).topk(k)  # index in [0, k*nc)
+    anchor_of = ori_index.gather(1, index // nc)  # (B, k) back to anchor ids
+    boxes = boxes.gather(dim=1, index=anchor_of.unsqueeze(-1).repeat(1, 1, 4))
+    return torch.cat([boxes, scores[..., None], (index % nc)[..., None].float()], dim=-1)
 
     def bias_init(self):
         """Prior-probability init for fresh heads (call after strides are known).
