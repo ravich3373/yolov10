@@ -58,7 +58,7 @@ class ExperimentTracker:
         self.history.append(entry)
         for k, v in entry.items():
             if isinstance(v, (int, float)) and k != "epoch":
-                group = "val" if k in ("ap50", "recall", "n_gt") else "train"
+                group = "val" if k.startswith(("ap50", "recall", "n_gt")) else "train"
                 self.tb.add_scalar(f"{group}/{k}", v, entry.get("epoch", len(self.history)))
         # incremental CSV: header from the first epoch's keys
         if self._csv_keys is None:
@@ -144,7 +144,7 @@ class ExperimentTracker:
         model = model.eval()
         cells = []
         for i in range(min(n, len(dataset))):
-            img_t, gt = dataset[i]
+            img_t, gt, _src = dataset[i]
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                 dets = model(_to_device(img_t.unsqueeze(0), device)).float()[0]
             img = img_t.permute(1, 2, 0).numpy().copy()

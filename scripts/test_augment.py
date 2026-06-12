@@ -88,8 +88,9 @@ for i in range(4):
 corpus = pl.DataFrame(rows)
 
 ds = PlateDataset(corpus, root, "train", augment=False)
-t, b = ds[0]
+t, b, src = ds[0]
 check("dataset eval path: uint8 tensor (3,640,640)", t.shape == (3, 640, 640) and t.dtype == torch.uint8)
+check("dataset: source defaults to 'all' without a source column", src == "all")
 # letterbox 640x480 -> scale 1.0, pad y=80: box shifts to (100,200,260,250)
 check("dataset eval path: letterbox box math exact", torch.allclose(b[0], torch.tensor([100.0, 200.0, 260.0, 250.0])))
 
@@ -97,7 +98,7 @@ ds = PlateDataset(corpus, root, "train", augment=True)  # mosaic=1.0 default
 check("dataset mosaic enabled under augment", ds.mosaic_enabled)
 ok = True
 for i in range(12):
-    t, b = ds[i % 4]
+    t, b, _ = ds[i % 4]
     ok &= t.shape == (3, 640, 640) and (len(b) == 0 or ((b >= 0).all() and (b <= 640).all()))
 check("dataset augment path x12: valid tensors, boxes in-frame", bool(ok))
 ds.disable_mosaic()
