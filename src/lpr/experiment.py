@@ -11,10 +11,8 @@
       analysis/
         results.png    loss/AP/lr curves
         pr_curve.png   final precision-recall curve on val
+        train_batch*.jpg  augmented batches as the model sees them
         val_preds.jpg  grid of val images: GT (green) vs predictions (red)
-
-plus one auto-appended index row in exps.md at the repo root (hypotheses and
-conclusions are edited by hand there — the tooling only keeps the ledger).
 """
 
 from __future__ import annotations
@@ -97,7 +95,6 @@ class ExperimentTracker:
         }
         self.log(f"finished: {summary}")
         self._log_file.close()
-        _append_exps_md(self.dir, summary)
 
     # ---------------- analysis artifacts ----------------
 
@@ -239,23 +236,3 @@ def _plot_results(history: list[dict], out: Path) -> None:
     plt.close(fig)
 
 
-def _append_exps_md(run_dir: Path, summary: dict) -> None:
-    """One ledger row per run in exps.md (repo root). Hypotheses/conclusions are
-    edited by hand above the ledger; the tooling only appends facts."""
-    exps = run_dir.parent.parent / "exps.md"
-    if not exps.exists():
-        exps.write_text(
-            "# Experiments\n\nHand-edited notes per experiment go here (hypothesis, conclusion).\n"
-            "The ledger below is auto-appended by ExperimentTracker.\n\n"
-            "## Ledger\n\n| run | date | epochs | best ap50 | notes |\n|---|---|---|---|---|\n"
-        )
-    best = summary.get("best")
-    row = (
-        f"| [{run_dir.name}]({run_dir.relative_to(run_dir.parent.parent)}) "
-        f"| {datetime.now().strftime('%Y-%m-%d %H:%M')} "
-        f"| {summary.get('epochs', '?')} "
-        f"| {f'{best:.4f}' if isinstance(best, float) else best} "
-        f"| {summary.get('notes', '')} |\n"
-    )
-    with open(exps, "a") as f:
-        f.write(row)

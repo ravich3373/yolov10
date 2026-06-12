@@ -157,7 +157,6 @@ def main():
         check(f"tracker artifact exists: {f}", (run / f).exists() and (run / f).stat().st_size > 0)
     check("tracker: tensorboard events written", any((run / "tb").glob("events.*")))
     check("tracker: results.csv has header + 8 epochs", len((run / "results.csv").read_text().splitlines()) == 9)
-    check("tracker: exps.md ledger row appended", "smoke-t0" in (root / "exps.md").read_text())
     import json as _json
 
     manifest = _json.loads((run / "manifest.json").read_text())
