@@ -44,7 +44,11 @@ def main():
     ap.add_argument("--weights", default=str(REPO / "weights" / "yolov10s.pt"))
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=5e-3)
+    ap.add_argument("--optimizer", default="auto", choices=("auto", "sgd", "adamw"),
+                    help="auto = ultralytics rule: SGD(0.01,.937) if >10k steps else AdamW(0.002*5/(4+nc))")
+    ap.add_argument("--lr", default="auto", help="float, or 'auto' to let the optimizer rule pick lr0")
+    ap.add_argument("--momentum", type=float, default=0.937)
+    ap.add_argument("--weight-decay", type=float, default=5e-4, help="weights only (biases/BN excluded), scaled by batch/64")
     ap.add_argument("--lrf", type=float, default=0.01, help="final lr fraction")
     ap.add_argument("--warmup-epochs", type=float, default=3.0)
     ap.add_argument("--cos-lr", action="store_true", help="cosine decay (default linear)")
@@ -91,7 +95,9 @@ def main():
 
     history = train_plate(
         model, trainable, train_ds, val_ds or None,
-        epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, lrf=args.lrf,
+        epochs=args.epochs, batch_size=args.batch_size,
+        optimizer=args.optimizer, lr=None if args.lr == "auto" else float(args.lr),
+        momentum=args.momentum, weight_decay=args.weight_decay, lrf=args.lrf,
         warmup_epochs=args.warmup_epochs, cos_lr=args.cos_lr,
         close_mosaic=args.close_mosaic, use_ema=not args.no_ema,
         amp=not args.no_amp, workers=args.workers, loss_fn=loss_fn,
