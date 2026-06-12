@@ -4,5 +4,6 @@
 /weights/
 /artifacts/
 /runs/
+/experiments/
 __pycache__/
 *.pyc
