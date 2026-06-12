@@ -67,8 +67,9 @@ class PlateDataset(Dataset):
         hyp: dict | None = None,
     ):
         cols = ["image_path", "label_path", "width", "height"]
-        if "source" in corpus.columns:  # synthetic test corpora have no source column
-            cols.append("source")
+        for opt in ("source", "sparse"):  # synthetic test corpora may lack these
+            if opt in corpus.columns:
+                cols.append(opt)
         self.rows = corpus.filter(pl.col("split") == split).select(cols).to_dicts()
         self.data_root = Path(data_root)
         self.img_size = img_size
@@ -93,10 +94,17 @@ class PlateDataset(Dataset):
         boxes = np.array(read_yolo_label(self.data_root / r["label_path"], r["width"], r["height"]), dtype=np.float32).reshape(-1, 4)
         return img, boxes
 
+    def _sparse(self, i) -> bool:
+        return bool(self.rows[i].get("sparse") or False)
+
     def __getitem__(self, i):
         hyp, size = self.hyp, self.img_size
+        sparse = self._sparse(i)
         if self.mosaic_enabled and np.random.rand() < hyp["mosaic"]:
             idxs = [i, *np.random.randint(0, len(self), 3)]
+            # conservative: a mosaic tile is sparse if ANY contributing image is —
+            # its unlabeled plates could land anywhere in the composite
+            sparse = any(self._sparse(j) for j in idxs)
             img, boxes = mosaic4([self._load(j) for j in idxs], size)
             # border=-size/2 crops the 2x mosaic canvas back to train size
             img, boxes = random_affine(
@@ -121,12 +129,13 @@ class PlateDataset(Dataset):
         t = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1).contiguous()
         # source of the PRIMARY image: under mosaic the tile mixes up to 4 sources,
         # so per-source train attribution is approximate during mosaic epochs
-        return t, torch.from_numpy(boxes.reshape(-1, 4)), self.rows[i].get("source", "all")
+        return t, torch.from_numpy(boxes.reshape(-1, 4)), self.rows[i].get("source", "all"), sparse
 
 
 def collate(batch):
     imgs = torch.stack([b[0] for b in batch])
-    return imgs, [b[1] for b in batch], [b[2] for b in batch]  # boxes list, source list
+    # boxes list, source list, sparse-annotation flags
+    return imgs, [b[1] for b in batch], [b[2] for b in batch], torch.tensor([b[3] for b in batch])
 
 
 def _worker_init(_):
@@ -229,8 +238,20 @@ def assign_targets(
 # ---------------------------------------------------------------------------
 
 
+def _bce_weights(targets: torch.Tensor, bg_weight: torch.Tensor | None) -> torch.Tensor | None:
+    """Per-anchor BCE weights: positives always 1; background anchors of
+    sparse-annotated images get bg_weight (<1). The PU-learning insight
+    (arXiv:2002.04672) reduced to a reweighting: on images with known-incomplete
+    labels, 'background' is really 'unlabeled' — full-strength negatives there
+    actively teach the model to suppress the unlabeled plates."""
+    if bg_weight is None:
+        return None
+    return torch.where(targets > 0, torch.ones_like(targets), bg_weight[:, None].expand_as(targets))
+
+
 def plate_loss(
-    model: YOLOv10, imgs: torch.Tensor, gt_boxes: list[torch.Tensor], amp: bool = True
+    model: YOLOv10, imgs: torch.Tensor, gt_boxes: list[torch.Tensor], amp: bool = True,
+    bg_weight: torch.Tensor | None = None,  # (B,) per-image background weight
 ) -> tuple[torch.Tensor, dict]:
     """BCE on the plate channel of both branches; everything else untouched.
     Forward runs under bf16 autocast (safe: the trunk is frozen, gradients touch
@@ -254,6 +275,9 @@ def plate_loss(
             boxes = (dist2bbox(dist, anchors.T.unsqueeze(0), xywh=False, dim=1) * strides.T).permute(0, 2, 1)
             targets, _, _ = assign_targets(logits.detach().sigmoid(), boxes, anchor_xy, gts, topk)  # (B, A)
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")  # (B, A)
+        w = _bce_weights(targets, bg_weight)
+        if w is not None:
+            bce = bce * w
         loss = bce.sum() / max(targets.sum().item(), 1.0)
         total = total + loss
         stats[name] = loss.item()
@@ -295,7 +319,8 @@ def dfl_loss(dist_logits: torch.Tensor, target: torch.Tensor, reg_max: int = 16)
 
 
 def plate_t1_loss(
-    model, imgs: torch.Tensor, gt_boxes: list[torch.Tensor], amp: bool = True
+    model, imgs: torch.Tensor, gt_boxes: list[torch.Tensor], amp: bool = True,
+    bg_weight: torch.Tensor | None = None,  # (B,) per-image background weight
 ) -> tuple[torch.Tensor, dict]:
     """Full v8-style detection loss for the Tier-1 plate head (cls BCE + CIoU box
     + DFL, ultralytics gains 0.5/7.5/1.5), one2many topk=10 + one2one topk=1.
@@ -321,6 +346,9 @@ def plate_t1_loss(
         img_tsum = targets.sum(1).clamp(min=1.0)  # (B,) per-image normalizers
 
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        w = _bce_weights(targets, bg_weight)
+        if w is not None:
+            bce = bce * w
         loss_cls = bce.sum() / t_sum
         loss_box = boxes.new_zeros(())
         loss_dfl = boxes.new_zeros(())
@@ -388,7 +416,7 @@ def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: flo
     imbalanced, so aggregate numbers alone would hide regressions on the small
     deployment-relevant slices (e.g. openalpr-US)."""
     buckets: dict[str, dict] = {}  # source -> {"scored": [(conf, tp)], "n_gt": int}
-    for imgs, gts, srcs in tqdm(loader, desc="  eval", unit="b", leave=False, mininterval=2, dynamic_ncols=True):
+    for imgs, gts, srcs, _sparse in tqdm(loader, desc="  eval", unit="b", leave=False, mininterval=2, dynamic_ncols=True):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             dets = model(_to_device(imgs, device)).float()  # (B, 300, 6) xyxy, conf, cls
         for b in range(imgs.shape[0]):
@@ -508,6 +536,7 @@ def train_plate(
     warmup_epochs: float = 3.0,
     warmup_momentum: float = 0.8,  # SGD momentum ramps from here to `momentum`
     warmup_bias_lr: float = 0.1,  # SGD bias group starts hot (ultralytics)
+    sparse_bg_weight: float = 0.1,  # background BCE weight on sparse-annotated images (1.0 disables)
     cos_lr: bool = False,  # linear decay by default, like ultralytics
     close_mosaic: int = 10,  # mosaic off for the last N epochs
     use_ema: bool = True,
@@ -563,7 +592,7 @@ def train_plate(
         losses, branch_losses = [], {"o2m": [], "o2o": []}
         src_losses: dict[str, list] = {}
         pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}", unit="b", mininterval=2, dynamic_ncols=True)
-        for bi, (imgs, gts, srcs) in enumerate(pbar):
+        for bi, (imgs, gts, srcs, sparse) in enumerate(pbar):
             # what the model ACTUALLY sees: first batches + the close_mosaic switch
             if tracker is not None and bi < (3 if epoch == 0 else 0):
                 tracker.plot_train_batch(imgs, gts, bi)
@@ -579,7 +608,11 @@ def train_plate(
                         g["momentum"] = float(np.interp(ni, [0, nw], [warmup_momentum, momentum]))
                 else:
                     g["lr"] = target_lr
-            loss, stats = loss_fn(model, _to_device(imgs, device), gts, amp=amp)
+            bg_w = None
+            if sparse_bg_weight < 1.0 and bool(sparse.any()):
+                ones = torch.ones(len(sparse), device=device)
+                bg_w = torch.where(sparse.to(device), ones * sparse_bg_weight, ones)
+            loss, stats = loss_fn(model, _to_device(imgs, device), gts, amp=amp, bg_weight=bg_w)
             opt.zero_grad()
             loss.backward()
             opt.step()

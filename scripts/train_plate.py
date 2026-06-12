@@ -56,6 +56,8 @@ def main():
     ap.add_argument("--mosaic", type=float, default=1.0, help="mosaic probability")
     ap.add_argument("--no-ema", action="store_true")
     ap.add_argument("--no-amp", action="store_true", help="disable bf16 autocast")
+    ap.add_argument("--sparse-bg-weight", type=float, default=0.1,
+                    help="background BCE weight on sparse-annotated images (CCPD etc.); 1.0 disables")
     ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--tier", type=int, default=0, choices=(0, 1),
                     help="0: 774-param linear probe; 1: full parallel plate head (own box+cls branches, ~1.6M params)")
@@ -101,6 +103,7 @@ def main():
         warmup_epochs=args.warmup_epochs, cos_lr=args.cos_lr,
         close_mosaic=args.close_mosaic, use_ema=not args.no_ema,
         amp=not args.no_amp, workers=args.workers, loss_fn=loss_fn,
+        sparse_bg_weight=args.sparse_bg_weight,
         tracker=tracker, save_fn=save_fn,
     )
 

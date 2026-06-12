@@ -144,7 +144,7 @@ class ExperimentTracker:
         model = model.eval()
         cells = []
         for i in range(min(n, len(dataset))):
-            img_t, gt, _src = dataset[i]
+            img_t, gt, _src, _sparse = dataset[i]
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                 dets = model(_to_device(img_t.unsqueeze(0), device)).float()[0]
             img = img_t.permute(1, 2, 0).numpy().copy()
