@@ -21,14 +21,16 @@ import torch  # noqa: E402
 
 from lpr.data.datasets.base import sha256_file  # noqa: E402
 from lpr.experiment import ExperimentTracker  # noqa: E402
-from lpr.models.plate_head import PlateT1Model, add_plate_class  # noqa: E402
+from lpr.models.plate_head import PlateT1Model, add_plate_class, extend_to_81_trainable  # noqa: E402
 from lpr.models.yolov10 import YOLOv10  # noqa: E402
 from lpr.train import (  # noqa: E402
     PlateDataset,
     collate,
     evaluate_ap50,
+    plate_ft_loss,
     plate_loss,
     plate_t1_loss,
+    save_plate_ft,
     save_plate_head,
     save_plate_t1,
     train_plate,
@@ -59,8 +61,9 @@ def main():
     ap.add_argument("--sparse-bg-weight", type=float, default=0.1,
                     help="background BCE weight on sparse-annotated images (CCPD etc.); 1.0 disables")
     ap.add_argument("--workers", type=int, default=32)
-    ap.add_argument("--tier", type=int, default=0, choices=(0, 1),
-                    help="0: 774-param linear probe; 1: full parallel plate head (own box+cls branches, ~1.6M params)")
+    ap.add_argument("--tier", default="0", choices=("0", "1", "ft"),
+                    help="0: 774-param probe; 1: parallel plate head (~1.6M); "
+                         "ft: NAIVE FULL FINE-TUNE baseline (everything trainable, COCO expected to degrade)")
     ap.add_argument("--name", default="", help="experiment name (default: t<tier>); run dir = experiments/<name>")
     ap.add_argument("--out", default=str(REPO / "artifacts" / "plate_head.pt"))
     args = ap.parse_args()
@@ -74,11 +77,13 @@ def main():
         sys.exit("no train rows — run build_datasets.py + dedup_and_split.py first")
 
     base = YOLOv10.from_ultralytics_pt(args.weights, args.variant)
-    if args.tier == 0:
+    if args.tier == "0":
         model, trainable, loss_fn, save_fn = base, add_plate_class(base), plate_loss, save_plate_head
-    else:
+    elif args.tier == "1":
         model = PlateT1Model(base)
         trainable, loss_fn, save_fn = model.trainable_parameters(), plate_t1_loss, save_plate_t1
+    else:  # ft — naive full fine-tune baseline
+        model, trainable, loss_fn, save_fn = base, extend_to_81_trainable(base), plate_ft_loss, save_plate_ft
     n_trainable = sum(p.numel() for p in trainable)
 
     fingerprint = {
@@ -104,6 +109,7 @@ def main():
         close_mosaic=args.close_mosaic, use_ema=not args.no_ema,
         amp=not args.no_amp, workers=args.workers, loss_fn=loss_fn,
         sparse_bg_weight=args.sparse_bg_weight,
+        auto_lr_nc=81 if args.tier == "ft" else 1,
         tracker=tracker, save_fn=save_fn,
     )
 
@@ -124,8 +130,8 @@ def main():
 
     # keep the deploy artifact where export_onnx.py looks for it (= best checkpoint)
     out = Path(args.out)
-    if args.tier == 1 and out == REPO / "artifacts" / "plate_head.pt":
-        out = REPO / "artifacts" / "plate_head_t1.pt"
+    if args.tier != "0" and out == REPO / "artifacts" / "plate_head.pt":
+        out = REPO / "artifacts" / f"plate_head_t{args.tier}.pt"
     best = tracker.dir / "best.pt"
     if best.exists():
         out.parent.mkdir(parents=True, exist_ok=True)

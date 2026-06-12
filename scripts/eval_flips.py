@@ -21,9 +21,9 @@ import torch  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
 from lpr.flips import count_flips  # noqa: E402
-from lpr.models.plate_head import PlateT1Model, add_plate_class  # noqa: E402
+from lpr.models.plate_head import PlateT1Model, add_plate_class, extend_to_81_trainable  # noqa: E402
 from lpr.models.yolov10 import YOLOv10  # noqa: E402
-from lpr.train import PlateDataset, collate, load_plate_head, load_plate_t1  # noqa: E402
+from lpr.train import PlateDataset, collate, load_plate_ft, load_plate_head, load_plate_t1  # noqa: E402
 
 
 def load_model(ckpt_path: Path, weights: str, variant: str):
@@ -32,10 +32,14 @@ def load_model(ckpt_path: Path, weights: str, variant: str):
     if "plate_head_t1" in payload:
         model = PlateT1Model(base)
         load_plate_t1(model, ckpt_path)
-        return model, 1
+        return model, "1"
+    if "model_ft" in payload:
+        extend_to_81_trainable(base)
+        load_plate_ft(base, ckpt_path)
+        return base.eval(), "ft"
     add_plate_class(base)
     load_plate_head(base, ckpt_path)
-    return base, 0
+    return base, "0"
 
 
 def main():
