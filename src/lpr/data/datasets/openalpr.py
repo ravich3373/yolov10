@@ -50,7 +50,8 @@ class OpenALPR(LprDataset):
                 if img is None:
                     continue
                 # group by plate text: the US wts-* frames capture the same cars repeatedly
-                yield Sample(img, [box], group_key=plate or img.stem, subset=region)
+                # sparse: only ONE plate labeled per image even when others are visible
+                yield Sample(img, [box], group_key=plate or img.stem, subset=region, sparse=True)
 
 
 def _find_image(txt: Path) -> Path | None:

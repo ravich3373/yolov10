@@ -55,11 +55,13 @@ class CCPD(LprDataset):
             parsed = parse_ccpd_filename(img.stem)
             if parsed is None:
                 if subset == "ccpd_np":  # negatives: car, no plate — empty label is the point
-                    yield Sample(img, [], group_key=f"np:{img.stem}", subset=subset)
+                    yield Sample(img, [], group_key=f"np:{img.stem}", subset=subset)  # exhaustive: NOT sparse
                 continue
             boxes, plate_id = parsed
             # CCPD2020 green subset stores author splits as train/val/test dirs
             author_split = img.parent.name if img.parent.name in ("train", "val", "test") else ""
             # group by plate identity: the same physical car photographed twice can
             # never straddle train/val (the 19% near-dup leakage in the original split)
-            yield Sample(img, boxes, group_key=plate_id, subset=subset, author_split=author_split)
+            # sparse=True: CCPD annotates EXACTLY ONE plate per image; background
+            # vehicles' plates are unlabeled — never train them as hard negatives
+            yield Sample(img, boxes, group_key=plate_id, subset=subset, author_split=author_split, sparse=True)

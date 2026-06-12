@@ -28,6 +28,12 @@ class Sample:
     group_key: str
     subset: str = ""
     author_split: str = ""
+    # sparse=True: the labels are KNOWN-INCOMPLETE for the plate class (e.g. CCPD
+    # annotates exactly one plate per image). Training treats background on these
+    # images as unlabeled rather than negative (PU-style down-weighting) — else
+    # every unlabeled plate teaches suppression (arXiv:2002.04672 shows the
+    # detection rate of unlabeled objects dips after each such gradient).
+    sparse: bool = False
     # width/height optional: parser may know them for free (e.g. fixed-size datasets);
     # otherwise the base reads them from the image header.
     width: int = 0
@@ -104,6 +110,7 @@ class LprDataset:
             license_tier=self.license_tier,
             eval_only=self.eval_only,
             author_split=s.author_split,
+            sparse=s.sparse,
         )
 
 
