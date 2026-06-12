@@ -24,6 +24,7 @@ EPOCHS       ?= 20
 BATCH        ?= 128
 LR           ?= 1e-2
 WORKERS      ?= 32
+TIER         ?= 0
 RADIUS       ?= 8
 SEED         ?= 0
 EXPORT_BATCH ?= 1
@@ -56,7 +57,7 @@ prep: ## pHash dedup + splits + leakage purge -> data/corpus.parquet
 
 train: weights ## train plate head (frozen trunk) -> artifacts/plate_head.pt
 	$(call LOGGED,$(PY) scripts/train_plate.py --variant $(VARIANT) --weights weights/yolov10$(VARIANT).pt \
-	    --epochs $(EPOCHS) --batch-size $(BATCH) --lr $(LR) --workers $(WORKERS),train)
+	    --epochs $(EPOCHS) --batch-size $(BATCH) --lr $(LR) --workers $(WORKERS) --tier $(TIER),train)
 
 test: weights ## full verification suite (parity, surgery, parsers, dedup/split, augment, training)
 	$(PY) scripts/verify_yolov10_parity.py $(VARIANT)

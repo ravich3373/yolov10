@@ -18,11 +18,19 @@ sys.path.insert(0, str(REPO / "src"))
 import polars as pl  # noqa: E402
 import torch  # noqa: E402
 
-from lpr.models.plate_head import add_plate_class  # noqa: E402
+from lpr.models.plate_head import PlateT1Model, add_plate_class  # noqa: E402
 from lpr.models.yolov10 import YOLOv10  # noqa: E402
-from lpr.train import PlateDataset, evaluate_ap50, save_plate_head, train_plate  # noqa: E402
+from lpr.train import (  # noqa: E402
+    PlateDataset,
+    collate,
+    evaluate_ap50,
+    plate_loss,
+    plate_t1_loss,
+    save_plate_head,
+    save_plate_t1,
+    train_plate,
+)
 from torch.utils.data import DataLoader  # noqa: E402
-from lpr.train import collate  # noqa: E402
 
 
 def main():
@@ -42,6 +50,8 @@ def main():
     ap.add_argument("--no-ema", action="store_true")
     ap.add_argument("--no-amp", action="store_true", help="disable bf16 autocast")
     ap.add_argument("--workers", type=int, default=32)
+    ap.add_argument("--tier", type=int, default=0, choices=(0, 1),
+                    help="0: 774-param linear probe; 1: full parallel plate head (own box+cls branches, ~1.6M params)")
     ap.add_argument("--out", default=str(REPO / "artifacts" / "plate_head.pt"))
     args = ap.parse_args()
 
@@ -53,16 +63,20 @@ def main():
     if len(train_ds) == 0:
         sys.exit("no train rows — run build_datasets.py + dedup_and_split.py first")
 
-    model = YOLOv10.from_ultralytics_pt(args.weights, args.variant)
-    trainable = add_plate_class(model)
-    print(f"trainable: {sum(p.numel() for p in trainable)} params (of {sum(p.numel() for p in model.parameters()):,})")
+    base = YOLOv10.from_ultralytics_pt(args.weights, args.variant)
+    if args.tier == 0:
+        model, trainable, loss_fn = base, add_plate_class(base), plate_loss
+    else:
+        model = PlateT1Model(base)
+        trainable, loss_fn = model.trainable_parameters(), plate_t1_loss
+    print(f"tier {args.tier} | trainable: {sum(p.numel() for p in trainable):,} params (of {sum(p.numel() for p in model.parameters()):,})")
 
     history = train_plate(
         model, trainable, train_ds, val_ds or None,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, lrf=args.lrf,
         warmup_epochs=args.warmup_epochs, cos_lr=args.cos_lr,
         close_mosaic=args.close_mosaic, use_ema=not args.no_ema,
-        amp=not args.no_amp, workers=args.workers,
+        amp=not args.no_amp, workers=args.workers, loss_fn=loss_fn,
     )
 
     if len(test_ds):
@@ -70,8 +84,15 @@ def main():
         loader = DataLoader(test_ds, batch_size=args.batch_size, collate_fn=collate, num_workers=4)
         print("test:", evaluate_ap50(model, loader, str(device)))
 
-    save_plate_head(model, Path(args.out), meta={"variant": args.variant, "weights": args.weights, "history": history})
-    print(f"saved {args.out}")
+    meta = {"variant": args.variant, "weights": args.weights, "tier": args.tier, "history": history}
+    out = Path(args.out)
+    if args.tier == 0:
+        save_plate_head(model, out, meta=meta)
+    else:
+        if out == REPO / "artifacts" / "plate_head.pt":  # don't clobber the tier-0 artifact by default
+            out = REPO / "artifacts" / "plate_head_t1.pt"
+        save_plate_t1(model, out, meta=meta)
+    print(f"saved {out}")
 
 
 if __name__ == "__main__":
