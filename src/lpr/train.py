@@ -66,7 +66,10 @@ class PlateDataset(Dataset):
         augment: bool = False,
         hyp: dict | None = None,
     ):
-        self.rows = corpus.filter(pl.col("split") == split).select("image_path", "label_path", "width", "height").to_dicts()
+        cols = ["image_path", "label_path", "width", "height"]
+        if "source" in corpus.columns:  # synthetic test corpora have no source column
+            cols.append("source")
+        self.rows = corpus.filter(pl.col("split") == split).select(cols).to_dicts()
         self.data_root = Path(data_root)
         self.img_size = img_size
         self.augment = augment
@@ -116,12 +119,14 @@ class PlateDataset(Dataset):
         # (32 workers x prefetch x batch of fp32 640px images ~ 80GB — it OOM-killed
         # a shell once). Normalization happens on the GPU in _to_device.
         t = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1).contiguous()
-        return t, torch.from_numpy(boxes.reshape(-1, 4))
+        # source of the PRIMARY image: under mosaic the tile mixes up to 4 sources,
+        # so per-source train attribution is approximate during mosaic epochs
+        return t, torch.from_numpy(boxes.reshape(-1, 4)), self.rows[i].get("source", "all")
 
 
 def collate(batch):
     imgs = torch.stack([b[0] for b in batch])
-    return imgs, [b[1] for b in batch]  # variable box counts -> list
+    return imgs, [b[1] for b in batch], [b[2] for b in batch]  # boxes list, source list
 
 
 def _worker_init(_):
@@ -241,15 +246,20 @@ def plate_loss(
     gts = [g.to(imgs.device, non_blocking=True) for g in gt_boxes]
 
     total, stats = 0.0, {}
+    per_image = torch.zeros(imgs.shape[0], device=imgs.device)
     for name, branch, topk in (("o2m", o2m, 10), ("o2o", o2o, 1)):
         logits = branch["scores"][:, PLATE_CLASS].float()  # (B, A)
         with torch.no_grad():  # frozen box branch: assignment only
             dist = h.dfl(branch["boxes"].float())  # (B, 4, A)
             boxes = (dist2bbox(dist, anchors.T.unsqueeze(0), xywh=False, dim=1) * strides.T).permute(0, 2, 1)
             targets, _, _ = assign_targets(logits.detach().sigmoid(), boxes, anchor_xy, gts, topk)  # (B, A)
-        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="sum") / max(targets.sum().item(), 1.0)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")  # (B, A)
+        loss = bce.sum() / max(targets.sum().item(), 1.0)
         total = total + loss
         stats[name] = loss.item()
+        with torch.no_grad():  # per-image normalized loss, for per-source attribution
+            per_image += bce.sum(1) / targets.sum(1).clamp(min=1.0)
+    stats["per_image"] = per_image.detach()
     return total, stats
 
 
@@ -298,6 +308,8 @@ def plate_t1_loss(
     gts = [g.to(imgs.device, non_blocking=True) for g in gt_boxes]
 
     total, stats = 0.0, {}
+    B = imgs.shape[0]
+    per_image = torch.zeros(B, device=imgs.device)
     for name, topk in (("o2m", 10), ("o2o", 1)):
         branch = out[name]
         logits = branch["scores"][:, 0].float()  # (B, A) — single class
@@ -306,20 +318,33 @@ def plate_t1_loss(
         with torch.no_grad():
             targets, tboxes, fg = assign_targets(logits.detach().sigmoid(), boxes.detach(), anchor_xy, gts, topk)
         t_sum = max(targets.sum().item(), 1.0)
+        img_tsum = targets.sum(1).clamp(min=1.0)  # (B,) per-image normalizers
 
-        loss_cls = F.binary_cross_entropy_with_logits(logits, targets, reduction="sum") / t_sum
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        loss_cls = bce.sum() / t_sum
         loss_box = boxes.new_zeros(())
         loss_dfl = boxes.new_zeros(())
+        img_box = torch.zeros(B, device=imgs.device)
+        img_dfl = torch.zeros(B, device=imgs.device)
         if fg.any():
             w = targets[fg]
-            loss_box = ((1.0 - ciou(boxes[fg], tboxes[fg])) * w).sum() / t_sum
+            img_idx = fg.nonzero()[:, 0]  # which image each fg anchor belongs to
+            box_terms = (1.0 - ciou(boxes[fg], tboxes[fg])) * w
+            loss_box = box_terms.sum() / t_sum
             # DFL targets are distances in FEATURE units (the 16 bins are cell counts)
             ltrb = torch.cat([anchor_xy[None] - tboxes[..., :2], tboxes[..., 2:] - anchor_xy[None]], -1)
             ltrb = (ltrb / strides.T.unsqueeze(-1)).clamp(0, ph.reg_max - 1 - 0.01)  # (B,A,4) / (1,A,1)
             dist_logits = raw.view(raw.shape[0], 4, ph.reg_max, -1).permute(0, 3, 1, 2)  # (B,A,4,16)
-            loss_dfl = (dfl_loss(dist_logits[fg], ltrb[fg], ph.reg_max) * w).sum() / t_sum
+            dfl_terms = dfl_loss(dist_logits[fg], ltrb[fg], ph.reg_max) * w
+            loss_dfl = dfl_terms.sum() / t_sum
+            with torch.no_grad():
+                img_box.index_add_(0, img_idx, box_terms.detach())
+                img_dfl.index_add_(0, img_idx, dfl_terms.detach())
         total = total + 0.5 * loss_cls + 7.5 * loss_box + 1.5 * loss_dfl
         stats[name] = (0.5 * loss_cls + 7.5 * loss_box + 1.5 * loss_dfl).item()
+        with torch.no_grad():  # per-image normalized loss, for per-source attribution
+            per_image += (0.5 * bce.sum(1) + 7.5 * img_box + 1.5 * img_dfl) / img_tsum
+    stats["per_image"] = per_image.detach()
     return total, stats
 
 
@@ -340,45 +365,64 @@ def load_plate_t1(model, path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _ap_from_scored(scored: list, n_gt: int):
+    """scored: (conf, is_tp) list -> (ap50, recall, pr arrays)."""
+    if not scored or n_gt == 0:
+        return 0.0, 0.0, ([], [])
+    scored = sorted(scored, key=lambda x: -x[0])
+    tp = np.cumsum([s[1] for s in scored])
+    precision = tp / np.arange(1, len(scored) + 1)
+    recall = tp / n_gt
+    p_interp = np.maximum.accumulate(precision[::-1])[::-1]
+    ap, prev_r = 0.0, 0.0  # all-point interpolated AP
+    for r, p in zip(recall, p_interp):
+        ap += (r - prev_r) * p
+        prev_r = r
+    return float(ap), float(recall[-1]), (recall.tolist(), p_interp.tolist())
+
+
 @torch.inference_mode()
 def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: float = 1e-3, return_pr: bool = False) -> dict:
-    scored, n_gt = [], 0  # scored: (conf, is_true_positive)
-    for imgs, gts in tqdm(loader, desc="  eval", unit="b", leave=False, mininterval=2, dynamic_ncols=True):
+    """Plate AP@0.5 + recall, overall AND per source dataset (flat keys:
+    ap50_<source>, recall_<source>, n_gt_<source>). The corpus is heavily
+    imbalanced, so aggregate numbers alone would hide regressions on the small
+    deployment-relevant slices (e.g. openalpr-US)."""
+    buckets: dict[str, dict] = {}  # source -> {"scored": [(conf, tp)], "n_gt": int}
+    for imgs, gts, srcs in tqdm(loader, desc="  eval", unit="b", leave=False, mininterval=2, dynamic_ncols=True):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             dets = model(_to_device(imgs, device)).float()  # (B, 300, 6) xyxy, conf, cls
         for b in range(imgs.shape[0]):
+            bucket = buckets.setdefault(srcs[b], {"scored": [], "n_gt": 0})
             d = dets[b]
             d = d[(d[:, 5] == PLATE_CLASS) & (d[:, 4] >= conf_min)]
             gt = gts[b].to(device)
-            n_gt += len(gt)
+            bucket["n_gt"] += len(gt)
             matched = torch.zeros(len(gt), dtype=torch.bool, device=device)
             for row in d[d[:, 4].argsort(descending=True)]:
                 if len(gt) == 0:
-                    scored.append((row[4].item(), False))
+                    bucket["scored"].append((row[4].item(), False))
                     continue
                 ious = box_iou(row[None, :4], gt)[0]
                 ious[matched] = 0
                 best = ious.argmax()
                 if ious[best] >= 0.5:
                     matched[best] = True
-                    scored.append((row[4].item(), True))
+                    bucket["scored"].append((row[4].item(), True))
                 else:
-                    scored.append((row[4].item(), False))
-    if not scored or n_gt == 0:
-        return {"ap50": 0.0, "recall": 0.0, "n_gt": n_gt, **({"pr": ([], [])} if return_pr else {})}
-    scored.sort(key=lambda x: -x[0])
-    tp = np.cumsum([s[1] for s in scored])
-    precision = tp / np.arange(1, len(scored) + 1)
-    recall = tp / n_gt
-    p_interp = np.maximum.accumulate(precision[::-1])[::-1]
-    # all-point interpolated AP
-    ap, prev_r = 0.0, 0.0
-    for r, p in zip(recall, p_interp):
-        ap += (r - prev_r) * p
-        prev_r = r
-    out = {"ap50": float(ap), "recall": float(recall[-1]), "n_gt": n_gt}
+                    bucket["scored"].append((row[4].item(), False))
+
+    all_scored = [s for b in buckets.values() for s in b["scored"]]
+    all_gt = sum(b["n_gt"] for b in buckets.values())
+    ap, rec, pr = _ap_from_scored(all_scored, all_gt)
+    out = {"ap50": ap, "recall": rec, "n_gt": all_gt}
+    if len(buckets) > 1:
+        for src in sorted(buckets):
+            s_ap, s_rec, _ = _ap_from_scored(buckets[src]["scored"], buckets[src]["n_gt"])
+            out[f"ap50_{src}"] = s_ap
+            out[f"recall_{src}"] = s_rec
+            out[f"n_gt_{src}"] = buckets[src]["n_gt"]
     if return_pr:
-        out["pr"] = (recall.tolist(), p_interp.tolist())
+        out["pr"] = pr
     return out
 
 
@@ -517,8 +561,9 @@ def train_plate(
             train_ds.disable_mosaic()
             print(f"  epoch {epoch}: mosaic disabled (close_mosaic={close_mosaic})")
         losses, branch_losses = [], {"o2m": [], "o2o": []}
+        src_losses: dict[str, list] = {}
         pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}", unit="b", mininterval=2, dynamic_ncols=True)
-        for bi, (imgs, gts) in enumerate(pbar):
+        for bi, (imgs, gts, srcs) in enumerate(pbar):
             # what the model ACTUALLY sees: first batches + the close_mosaic switch
             if tracker is not None and bi < (3 if epoch == 0 else 0):
                 tracker.plot_train_batch(imgs, gts, bi)
@@ -543,6 +588,10 @@ def train_plate(
             losses.append(loss.item())
             for k in branch_losses:
                 branch_losses[k].append(stats[k])
+            # per-source train loss (attribution by primary image — approximate
+            # during mosaic epochs, exact after close_mosaic)
+            for li, src in zip(stats["per_image"].tolist(), srcs):
+                src_losses.setdefault(src, []).append(li)
             ni += 1
             pbar.set_postfix(
                 loss=f"{np.mean(losses):.3f}",
@@ -559,6 +608,8 @@ def train_plate(
             "lr": opt.param_groups[-1]["lr"],
             "time": round(time.time() - t0, 1),
         }
+        if len(src_losses) > 1:
+            entry |= {f"loss_{src}": float(np.mean(v)) for src, v in sorted(src_losses.items())}
         model.eval()
         if ema:
             ema.swap()  # evaluate AND checkpoint with EMA weights
