@@ -387,6 +387,41 @@ def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: flo
 # ---------------------------------------------------------------------------
 
 
+def build_optimizer(
+    params: list[torch.nn.Parameter],
+    name: str = "auto",
+    lr: float | None = None,
+    momentum: float = 0.937,
+    weight_decay: float = 5e-4,
+    iterations: int = 0,
+    nc: int = 1,
+    batch_size: int = 64,
+) -> torch.optim.Optimizer:
+    """Ultralytics' optimizer recipe:
+      auto rule  — >10k total steps: SGD(lr0=0.01, momentum .937, nesterov);
+                   otherwise AdamW with the 'fit' lr = 0.002*5/(4+nc), momentum .9
+      decay      — 5e-4 scaled by batch/64 (nominal batch), applied ONLY to >=2-D
+                   weights; biases and BN affine (all 1-D) get zero decay
+    Shape-based grouping (ndim) reproduces their name-based grouping exactly.
+    """
+    if name == "auto":
+        if iterations > 10_000:
+            name, lr0, momentum = "SGD", 0.01, 0.937
+        else:
+            name, lr0, momentum = "AdamW", round(0.002 * 5 / (4 + nc), 6), 0.9
+        lr = lr if lr is not None else lr0
+    assert lr is not None, "explicit --lr required when optimizer is not 'auto'"
+    decay = [p for p in params if p.ndim > 1]
+    no_decay = [p for p in params if p.ndim <= 1]
+    groups = [
+        {"params": no_decay, "weight_decay": 0.0},  # group 0: biases/BN — also gets bias-lr warmup
+        {"params": decay, "weight_decay": weight_decay * batch_size / 64},
+    ]
+    if name.lower() == "sgd":
+        return torch.optim.SGD(groups, lr=lr, momentum=momentum, nesterov=True)
+    return torch.optim.AdamW(groups, lr=lr, betas=(momentum, 0.999))
+
+
 class EMA:
     """Exponential moving average of the trainable params only (the frozen ones
     can't move, so this equals full-model EMA at a fraction of the cost).
@@ -421,9 +456,14 @@ def train_plate(
     val_ds: Dataset | None,
     epochs: int = 10,
     batch_size: int = 16,
-    lr: float = 5e-3,
+    optimizer: str = "auto",  # auto | sgd | adamw (ultralytics auto rule)
+    lr: float | None = None,  # None with optimizer=auto -> ultralytics' lr choice
+    momentum: float = 0.937,
+    weight_decay: float = 5e-4,
     lrf: float = 0.01,  # final lr fraction (ultralytics default)
     warmup_epochs: float = 3.0,
+    warmup_momentum: float = 0.8,  # SGD momentum ramps from here to `momentum`
+    warmup_bias_lr: float = 0.1,  # SGD bias group starts hot (ultralytics)
     cos_lr: bool = False,  # linear decay by default, like ultralytics
     close_mosaic: int = 10,  # mosaic off for the last N epochs
     use_ema: bool = True,
@@ -438,8 +478,6 @@ def train_plate(
     # freeze_bn_stats guard (train() is a no-op on them). Tier 1's own head has
     # live BNs that genuinely need train mode for their running stats.
     model = model.to(device).train()
-    opt = torch.optim.AdamW(trainable, lr=lr)
-    ema = EMA(trainable) if use_ema else None
     loader_kw = dict(
         batch_size=batch_size,
         collate_fn=collate,
@@ -452,12 +490,21 @@ def train_plate(
     train_loader = DataLoader(train_ds, shuffle=True, drop_last=len(train_ds) > batch_size, **loader_kw)
     val_loader = DataLoader(val_ds, **loader_kw) if val_ds else None
 
-    # schedule: per-epoch decay to lr*lrf (linear or cosine) + per-iter linear warmup
+    nb = max(len(train_loader), 1)
+    opt = build_optimizer(
+        trainable, name=optimizer, lr=lr, momentum=momentum, weight_decay=weight_decay,
+        iterations=nb * epochs, nc=1, batch_size=batch_size,
+    )
+    base_lr = opt.param_groups[-1]["lr"]  # resolved lr0 (auto rule may have chosen it)
+    is_sgd = isinstance(opt, torch.optim.SGD)
+    print(f"  optimizer: {type(opt).__name__} lr0={base_lr} ({nb * epochs} total steps)")
+    ema = EMA(trainable) if use_ema else None
+
+    # schedule: per-epoch decay to lr0*lrf (linear or cosine) + per-iter linear warmup
     if cos_lr:
         lf = lambda e: ((1 - math.cos(e * math.pi / epochs)) / 2) * (lrf - 1) + 1  # noqa: E731
     else:
         lf = lambda e: max(1 - e / epochs, 0) * (1 - lrf) + lrf  # noqa: E731
-    nb = max(len(train_loader), 1)
     nw = max(round(warmup_epochs * nb), 100) if warmup_epochs > 0 else 0
 
     import time
@@ -472,9 +519,16 @@ def train_plate(
         losses, branch_losses = [], {"o2m": [], "o2o": []}
         pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}", unit="b", mininterval=2, dynamic_ncols=True)
         for imgs, gts in pbar:
-            warm = min(ni / nw, 1.0) if nw else 1.0
-            for g in opt.param_groups:
-                g["lr"] = lr * lf(epoch) * warm
+            target_lr = base_lr * lf(epoch)
+            for j, g in enumerate(opt.param_groups):
+                if nw and ni < nw:
+                    # group 0 (biases/BN) warms DOWN from a hot lr under SGD (ultralytics)
+                    start = warmup_bias_lr if (j == 0 and is_sgd) else 0.0
+                    g["lr"] = float(np.interp(ni, [0, nw], [start, target_lr]))
+                    if is_sgd:
+                        g["momentum"] = float(np.interp(ni, [0, nw], [warmup_momentum, momentum]))
+                else:
+                    g["lr"] = target_lr
             loss, stats = loss_fn(model, _to_device(imgs, device), gts, amp=amp)
             opt.zero_grad()
             loss.backward()
@@ -489,7 +543,7 @@ def train_plate(
                 loss=f"{np.mean(losses):.3f}",
                 o2m=f"{stats['o2m']:.3f}",
                 o2o=f"{stats['o2o']:.3f}",
-                lr=f"{opt.param_groups[0]['lr']:.1e}",
+                lr=f"{opt.param_groups[-1]['lr']:.1e}",
                 refresh=False,
             )
         entry = {
@@ -497,7 +551,7 @@ def train_plate(
             "loss": float(np.mean(losses)),
             "o2m": float(np.mean(branch_losses["o2m"])),
             "o2o": float(np.mean(branch_losses["o2o"])),
-            "lr": opt.param_groups[0]["lr"],
+            "lr": opt.param_groups[-1]["lr"],
             "time": round(time.time() - t0, 1),
         }
         model.eval()
