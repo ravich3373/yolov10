@@ -60,7 +60,8 @@ src/lpr/data/manifest.py      manifest schema
 src/lpr/dedup.py              pHash + Hamming clustering (GPU-accelerated)
 src/lpr/split.py              group-aware splits + leakage purge
 src/lpr/augment.py            ultralytics train recipe: mosaic, affine, HSV, flip
-src/lpr/train.py              TAL assignment + plate-channel loss + schedules/EMA + AP50 eval
+src/lpr/train.py              TAL assignment + tier-0/1 losses + schedules/EMA + AP50 eval
+src/lpr/experiment.py         per-run tracking: config/manifest/log/csv/tensorboard/ckpts/plots
 ```
 
 ## Status / TODO
