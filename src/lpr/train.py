@@ -376,6 +376,75 @@ def plate_t1_loss(
     return total, stats
 
 
+def plate_ft_loss(
+    model, imgs: torch.Tensor, gt_boxes: list[torch.Tensor], amp: bool = True,
+    bg_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """BASELINE loss: naive fine-tuning of the 81-class extended head, all params
+    trainable. BCE runs over ALL 81 channels with targets only on the plate channel
+    — the 80 COCO channels receive pure-negative supervision on every image, which
+    is exactly the catastrophic-forgetting mechanism the literature fights and our
+    frozen tiers remove. Box+DFL supervise plate foreground anchors (the box branch
+    is shared, so COCO localization also drifts). Same TAL assignment as Tier 1."""
+    h = model.head
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp and imgs.is_cuda):
+        out = model(imgs)  # training dict from V10Detect: one2many + one2one
+    feats = out["one2many"]["feats"]
+    anchors, strides = make_anchors([f.float() for f in feats], h.stride, 0.5)
+    anchor_xy = anchors * strides
+    gts = [g.to(imgs.device, non_blocking=True) for g in gt_boxes]
+
+    total, stats = 0.0, {}
+    B = imgs.shape[0]
+    per_image = torch.zeros(B, device=imgs.device)
+    for name, key, topk in (("o2m", "one2many", 10), ("o2o", "one2one", 1)):
+        branch = out[key]
+        all_logits = branch["scores"].float()  # (B, 81, A)
+        plate_logits = all_logits[:, PLATE_CLASS]
+        raw = branch["boxes"].float()
+        boxes = (dist2bbox(h.dfl(raw), anchors.T.unsqueeze(0), xywh=False, dim=1) * strides.T).permute(0, 2, 1)
+        with torch.no_grad():
+            targets, tboxes, fg = assign_targets(plate_logits.detach().sigmoid(), boxes.detach(), anchor_xy, gts, topk)
+        t_sum = max(targets.sum().item(), 1.0)
+        img_tsum = targets.sum(1).clamp(min=1.0)
+
+        full_targets = torch.zeros_like(all_logits.permute(0, 2, 1))  # (B, A, 81)
+        full_targets[..., PLATE_CLASS] = targets
+        bce = F.binary_cross_entropy_with_logits(all_logits.permute(0, 2, 1), full_targets, reduction="none")
+        if bg_weight is not None:  # sparse down-weight applies to the plate channel only
+            w = _bce_weights(targets, bg_weight)
+            bce[..., PLATE_CLASS] = bce[..., PLATE_CLASS] * w
+        loss_cls = bce.sum() / t_sum
+
+        loss_box = boxes.new_zeros(())
+        loss_dfl = boxes.new_zeros(())
+        if fg.any():
+            w = targets[fg]
+            loss_box = ((1.0 - ciou(boxes[fg], tboxes[fg])) * w).sum() / t_sum
+            ltrb = torch.cat([anchor_xy[None] - tboxes[..., :2], tboxes[..., 2:] - anchor_xy[None]], -1)
+            ltrb = (ltrb / strides.T.unsqueeze(-1)).clamp(0, h.reg_max - 1 - 0.01)
+            dist_logits = raw.view(raw.shape[0], 4, h.reg_max, -1).permute(0, 3, 1, 2)
+            loss_dfl = (dfl_loss(dist_logits[fg], ltrb[fg], h.reg_max) * w).sum() / t_sum
+        total = total + 0.5 * loss_cls + 7.5 * loss_box + 1.5 * loss_dfl
+        stats[name] = (0.5 * loss_cls + 7.5 * loss_box + 1.5 * loss_dfl).item()
+        with torch.no_grad():
+            per_image += 0.5 * bce.sum((1, 2)) / img_tsum
+    stats["per_image"] = per_image.detach()
+    return total, stats
+
+
+def save_plate_ft(model, path: Path, meta: dict | None = None) -> None:
+    """Naive-FT baseline checkpoint: the FULL model state (~33MB) — everything moved."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model_ft": model.state_dict(), "meta": meta or {}}, path)
+
+
+def load_plate_ft(model, path: Path) -> dict:
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    model.load_state_dict(ckpt["model_ft"])
+    return ckpt["meta"]
+
+
 def save_plate_t1(model, path: Path, meta: dict | None = None) -> None:
     """Tier-1 checkpoint: the whole plate head (~6.5MB) — trunk stays the official file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -543,7 +612,8 @@ def train_plate(
     amp: bool = True,  # bf16 autocast on the frozen forward
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     workers: int = 16,
-    loss_fn=plate_loss,  # plate_loss (Tier 0) or plate_t1_loss (Tier 1)
+    auto_lr_nc: int = 1,  # nc fed to the optimizer auto rule (81 for the FT baseline)
+    loss_fn=plate_loss,  # plate_loss (T0) / plate_t1_loss (T1) / plate_ft_loss (baseline)
     tracker=None,  # ExperimentTracker: per-epoch metrics, tensorboard, ckpts
     save_fn=None,  # save_plate_head / save_plate_t1 — used for last.pt/best.pt
 ) -> list[dict]:
@@ -566,7 +636,7 @@ def train_plate(
     nb = max(len(train_loader), 1)
     opt = build_optimizer(
         trainable, name=optimizer, lr=lr, momentum=momentum, weight_decay=weight_decay,
-        iterations=nb * epochs, nc=1, batch_size=batch_size,
+        iterations=nb * epochs, nc=auto_lr_nc, batch_size=batch_size,
     )
     base_lr = opt.param_groups[-1]["lr"]  # resolved lr0 (auto rule may have chosen it)
     is_sgd = isinstance(opt, torch.optim.SGD)
