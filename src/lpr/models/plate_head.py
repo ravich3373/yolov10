@@ -124,6 +124,30 @@ def fuse_plate_head(model: YOLOv10) -> YOLOv10:
     return model
 
 
+def extend_to_81_trainable(model: YOLOv10, num_new: int = 1) -> list[nn.Parameter]:
+    """BASELINE path (naive fine-tuning, the standard IOD lower bound): enlarge the
+    REAL head's final cls convs 80 -> 81 and leave EVERYTHING trainable. Old-class
+    weights are copied, the new channel starts at the background prior — identical
+    init to our tiers, but nothing is frozen, no BN guard: COCO is expected to
+    degrade, and quantifying that degradation (mAP delta + negative flips) against
+    our frozen tiers is the point of the comparison."""
+    head: V10Detect = model.head
+    for branch in (head.cv3, head.one2one_cv3):
+        for i, seq in enumerate(branch):
+            old: nn.Conv2d = seq[2]
+            new = nn.Conv2d(old.in_channels, head.nc + num_new, 1)
+            with torch.no_grad():
+                new.weight[: head.nc] = old.weight
+                new.bias[: head.nc] = old.bias
+                new.weight[head.nc :] = 0.0
+                new.bias[head.nc :] = _prior_bias(head.nc, head.stride[i].item())
+            seq[2] = new
+    head.nc += num_new
+    head.no += num_new
+    model.nc = head.nc
+    return list(model.parameters())
+
+
 # ---------------------------------------------------------------------------
 # Tier 1: full parallel detection head for the plate class
 # ---------------------------------------------------------------------------
