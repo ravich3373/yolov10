@@ -198,6 +198,26 @@ def main():
     ap_fresh = evaluate_ap50(fresh.to(device).eval(), val_loader, device)["ap50"]
     check(f"t1: reloaded head reproduces AP ({ap_fresh:.3f} vs {ap_t1:.3f})", abs(ap_fresh - ap_t1) < 1e-4)
 
+    # ---------------- naive-FT baseline: must LEARN plates and DAMAGE COCO ----------------
+    print("\n--- ft baseline ---")
+    from lpr.models.plate_head import extend_to_81_trainable
+    from lpr.train import plate_ft_loss
+
+    ft = YOLOv10.from_ultralytics_pt(str(weights), "s") if weights.exists() else YOLOv10("s").eval()
+    trainable = extend_to_81_trainable(ft)
+    with torch.inference_mode():
+        feats = ft.forward_features(probe)
+        coco_pre = ft.head._forward_branch(feats, ft.head.one2one_cv2, ft.head.one2one_cv3)["scores"][:, :80].clone()
+    hist = train_plate(ft, trainable, train_ds, val_ds, epochs=4, batch_size=8, lr=5e-4,
+                       warmup_epochs=0, close_mosaic=1, device=device, workers=2, loss_fn=plate_ft_loss)
+    check(f"ft: learns plates (AP50 {hist[-1]['ap50']:.3f})", hist[-1]["ap50"] > 0.3)
+    ft = ft.cpu().eval()
+    with torch.inference_mode():
+        feats = ft.forward_features(probe)
+        coco_post = ft.head._forward_branch(feats, ft.head.one2one_cv2, ft.head.one2one_cv3)["scores"][:, :80]
+    drift = (coco_post - coco_pre).abs().max().item()
+    check(f"ft: COCO logits drift (max |Δ| {drift:.3f}) — the forgetting our tiers eliminate", drift > 0.1)
+
     print(f"\n{'ALL PASS' if not failures else f'{len(failures)} FAILURES: {failures}'}")
     sys.exit(1 if failures else 0)
 

@@ -1,8 +1,25 @@
 # Papers → code map
 
 Which techniques from the detector-class-extension reading corpus
-(`~/Documents/formalisms/detector-class-extension/`) live where in this repo,
-and what was deliberately deferred. Updated 2026-06-12.
+(`~/Documents/formalisms/detector-class-extension/`) live where in this repo —
+both ingredients we adopt AND literature methods implemented as BASELINES for the
+ours-vs-theirs comparison. Updated 2026-06-12.
+
+## Baselines for the comparison table (`--tier` / scripts)
+
+Protocol per method: plate AP50 on corpus val/test (per-source) · COCO retention
+(`eval_coco.py --compare artifacts/coco_eval_base.json`) · box-level negative
+flips vs base (`eval_flips.py`).
+
+| Method | Papers | Run as | Status |
+|---|---|---|---|
+| Ours T0: frozen trunk + cls probe | side-tuning lineage | `make train TIER=0` | done |
+| Ours T1: frozen trunk + parallel head | side-tuning lineage | `make train TIER=1` | done |
+| Naive full fine-tune (IOD lower bound) | every IOD paper's baseline | `make train TIER=ft` | done |
+| WiSE-FT weight interpolation (merging family) | `2109.01903`, `2212.04089`, MagMax (1-task) | `scripts/wise_ft.py <ft-ckpt>` | done |
+| FT + old-model COCO pseudo-labels | BPF `2407.11499`, MMA, PseDet | needs multi-class GT plumbing | queued next |
+| FT + COCO replay (1-10%) | RICO `2508.13878` ("replay beats everything") | needs COCO train subset + plumbing | queued next |
+| FT + output distillation (LwF/ERD-style) | `2204.01620` lineage | distill term on plate images | queued |
 
 ## Implemented
 
@@ -29,15 +46,13 @@ and what was deliberately deferred. Updated 2026-06-12.
   on the frozen COCO head's vehicle boxes (+7 AP@0.75 on small plates in-paper).
   Revisit after Tier-1 results on the full corpus.
 
-## Deliberately not implementing (with reason)
+## Not implementable as baselines here (with reason)
 
-- **Task arithmetic / model merging** (`2212.04089`, MagMax, DuET, TIES): only
-  meaningful when the trunk fine-tunes (Tier 2 contingency). For one task it
-  degenerates to weight interpolation; our frozen tiers have nothing to merge.
-- **Distillation-based forgetting control** (ERD, CL-DETR lineage, SDDGR
-  generative replay): solves a problem our architecture removes by construction;
-  RICO `2508.13878` additionally shows 1% replay beats all of it.
-- **DETR-specific machinery** (Q-MCMF matching, DyQ query isolation): wrong
-  architecture family for YOLOv10's NMS-free TAL pipeline.
-- **COCO-replay pseudo-labeling for old classes** (BPF bridge-the-past, MMA):
-  needed only if shared parameters unfreeze (Tier 2 plan B, documented in README).
+- **DETR-specific machinery** (Q-MCMF matching, DyQ query isolation, CL-DETR):
+  wrong architecture family for YOLOv10's NMS-free TAL pipeline; comparing across
+  detector families confounds the method with the architecture.
+- **SDDGR generative replay**: needs Stable Diffusion + GLIGEN conditioned on old
+  annotations — its own ablation shows pseudo-labeling does most of the work
+  (38.6 of 40.9 AP), which our queued pseudo-label baseline covers directly.
+- **TIES/MagMax multi-task merging**: degenerates to WiSE-FT interpolation for a
+  single added task (covered above).
