@@ -315,7 +315,7 @@ def plate_t1_loss(
             loss_box = ((1.0 - ciou(boxes[fg], tboxes[fg])) * w).sum() / t_sum
             # DFL targets are distances in FEATURE units (the 16 bins are cell counts)
             ltrb = torch.cat([anchor_xy[None] - tboxes[..., :2], tboxes[..., 2:] - anchor_xy[None]], -1)
-            ltrb = (ltrb / strides.T.unsqueeze(-1).transpose(1, 2)).clamp(0, ph.reg_max - 1 - 0.01)
+            ltrb = (ltrb / strides.T.unsqueeze(-1)).clamp(0, ph.reg_max - 1 - 0.01)  # (B,A,4) / (1,A,1)
             dist_logits = raw.view(raw.shape[0], 4, ph.reg_max, -1).permute(0, 3, 1, 2)  # (B,A,4,16)
             loss_dfl = (dfl_loss(dist_logits[fg], ltrb[fg], ph.reg_max) * w).sum() / t_sum
         total = total + 0.5 * loss_cls + 7.5 * loss_box + 1.5 * loss_dfl
