@@ -24,6 +24,7 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from lpr.data.datasets.base import write_yolo_label  # noqa: E402
+from lpr.experiment import ExperimentTracker  # noqa: E402
 from lpr.models.plate_head import PlateT1Model, add_plate_class  # noqa: E402
 from lpr.models.yolov10 import YOLOv10  # noqa: E402
 from lpr.train import (  # noqa: E402
@@ -117,8 +118,11 @@ def main():
 
     # warmup_epochs=0: the run is ~100 iters total, the default 3-epoch warmup would
     # never finish ramping. close_mosaic=2: 6 epochs WITH mosaic, then 2 letterboxed —
-    # exercises both train paths and the switch itself.
-    history = train_plate(model, trainable, train_ds, val_ds, epochs=8, batch_size=8, lr=1e-2, warmup_epochs=0, close_mosaic=2, device=device, workers=2)
+    # exercises both train paths and the switch itself. Tracker rooted in the temp
+    # dir exercises the whole experiment-artifact stack.
+    tracker = ExperimentTracker(root / "experiments", "smoke-t0", config={"smoke": True}, data_fingerprint={"n_train": len(train_ds)})
+    history = train_plate(model, trainable, train_ds, val_ds, epochs=8, batch_size=8, lr=1e-2, warmup_epochs=0, close_mosaic=2, device=device, workers=2,
+                          tracker=tracker, save_fn=save_plate_head)
     ap_after = history[-1]["ap50"]
 
     check(f"loss decreased ({history[0]['loss']:.3f} -> {history[-1]['loss']:.3f})", history[-1]["loss"] < 0.5 * history[0]["loss"])
@@ -140,6 +144,23 @@ def main():
     load_plate_head(fresh, ckpt)
     ap_fresh = evaluate_ap50(fresh.to(device), val_loader, device)["ap50"]
     check(f"reloaded head reproduces AP ({ap_fresh:.3f} vs {ap_after:.3f})", abs(ap_fresh - ap_after) < 1e-4)
+
+    # ---------------- experiment artifacts ----------------
+    res = evaluate_ap50(model.to(device), val_loader, device, return_pr=True)
+    tracker.plot_pr_curve(np.array(res["pr"][0]), np.array(res["pr"][1]), res["ap50"])
+    tracker.plot_val_predictions(model, val_ds, device, n=4)
+    tracker.finish({"notes": "smoke"})
+    run = tracker.dir
+    for f in ("config.json", "manifest.json", "log.txt", "results.csv", "history.json", "last.pt", "best.pt",
+              "analysis/results.png", "analysis/pr_curve.png", "analysis/val_preds.jpg"):
+        check(f"tracker artifact exists: {f}", (run / f).exists() and (run / f).stat().st_size > 0)
+    check("tracker: tensorboard events written", any((run / "tb").glob("events.*")))
+    check("tracker: results.csv has header + 8 epochs", len((run / "results.csv").read_text().splitlines()) == 9)
+    check("tracker: exps.md ledger row appended", "smoke-t0" in (root / "exps.md").read_text())
+    import json as _json
+
+    manifest = _json.loads((run / "manifest.json").read_text())
+    check("tracker: manifest has git commit + env", bool(manifest["git"]["commit"]) and manifest["env"]["torch"])
 
     # ---------------- Tier 1: full parallel plate head ----------------
     print("\n--- tier 1 ---")
