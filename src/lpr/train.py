@@ -26,6 +26,7 @@ import polars as pl
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from .augment import DEFAULT_HYP, hsv_augment, mosaic4, random_affine
 from .models.yolov10 import YOLOv10, dist2bbox, make_anchors
@@ -253,7 +254,7 @@ def plate_loss(
 @torch.inference_mode()
 def evaluate_ap50(model: YOLOv10, loader: DataLoader, device: str, conf_min: float = 1e-3) -> dict:
     scored, n_gt = [], 0  # scored: (conf, is_true_positive)
-    for imgs, gts in loader:
+    for imgs, gts in tqdm(loader, desc="  eval", unit="b", leave=False, mininterval=2, dynamic_ncols=True):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             dets = model(_to_device(imgs, device)).float()  # (B, 300, 6) xyxy, conf, cls
         for b in range(imgs.shape[0]):
@@ -367,11 +368,12 @@ def train_plate(
             train_ds.disable_mosaic()
             print(f"  epoch {epoch}: mosaic disabled (close_mosaic={close_mosaic})")
         losses = []
-        for imgs, gts in train_loader:
+        pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}", unit="b", mininterval=2, dynamic_ncols=True)
+        for imgs, gts in pbar:
             warm = min(ni / nw, 1.0) if nw else 1.0
             for g in opt.param_groups:
                 g["lr"] = lr * lf(epoch) * warm
-            loss, _ = plate_loss(model, _to_device(imgs, device), gts, amp=amp)
+            loss, stats = plate_loss(model, _to_device(imgs, device), gts, amp=amp)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -379,6 +381,13 @@ def train_plate(
                 ema.update()
             losses.append(loss.item())
             ni += 1
+            pbar.set_postfix(
+                loss=f"{np.mean(losses):.3f}",
+                o2m=f"{stats['o2m']:.3f}",
+                o2o=f"{stats['o2o']:.3f}",
+                lr=f"{opt.param_groups[0]['lr']:.1e}",
+                refresh=False,
+            )
         entry = {"epoch": epoch, "loss": float(np.mean(losses)), "lr": opt.param_groups[0]["lr"]}
         if val_loader is not None:
             if ema:
