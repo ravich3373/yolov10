@@ -24,9 +24,19 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from lpr.data.datasets.base import write_yolo_label  # noqa: E402
-from lpr.models.plate_head import add_plate_class  # noqa: E402
+from lpr.models.plate_head import PlateT1Model, add_plate_class  # noqa: E402
 from lpr.models.yolov10 import YOLOv10  # noqa: E402
-from lpr.train import PlateDataset, collate, evaluate_ap50, load_plate_head, save_plate_head, train_plate  # noqa: E402
+from lpr.train import (  # noqa: E402
+    PlateDataset,
+    collate,
+    evaluate_ap50,
+    load_plate_head,
+    load_plate_t1,
+    plate_t1_loss,
+    save_plate_head,
+    save_plate_t1,
+    train_plate,
+)
 from torch.utils.data import DataLoader  # noqa: E402
 
 rng = np.random.default_rng(0)
@@ -130,6 +140,30 @@ def main():
     load_plate_head(fresh, ckpt)
     ap_fresh = evaluate_ap50(fresh.to(device), val_loader, device)["ap50"]
     check(f"reloaded head reproduces AP ({ap_fresh:.3f} vs {ap_after:.3f})", abs(ap_fresh - ap_after) < 1e-4)
+
+    # ---------------- Tier 1: full parallel plate head ----------------
+    print("\n--- tier 1 ---")
+    base = YOLOv10.from_ultralytics_pt(str(weights), "s") if weights.exists() else YOLOv10("s").eval()
+    t1 = PlateT1Model(base)
+    base_state = {k: v.clone() for k, v in t1.base.state_dict().items()}
+    trainable = t1.trainable_parameters()
+    n_train = sum(p.numel() for p in trainable)
+    check(f"t1: ~1.6M trainable params ({n_train:,})", 1_000_000 < n_train < 3_000_000)
+
+    hist = train_plate(t1, trainable, train_ds, val_ds, epochs=8, batch_size=8, lr=2e-3,
+                       warmup_epochs=0, close_mosaic=2, device=device, workers=2, loss_fn=plate_t1_loss)
+    ap_t1 = hist[-1]["ap50"]
+    check(f"t1: loss decreased ({hist[0]['loss']:.3f} -> {hist[-1]['loss']:.3f})", hist[-1]["loss"] < 0.7 * hist[0]["loss"])
+    check(f"t1: AP50 > 0.5 ({ap_t1:.3f})", ap_t1 > 0.5)
+    frozen_ok = all(torch.equal(v.cpu(), base_state[k].cpu()) for k, v in t1.base.state_dict().items())
+    check("t1: every base tensor (incl. BN buffers) bit-identical after training", frozen_ok)
+
+    ckpt = root / "plate_head_t1.pt"
+    save_plate_t1(t1, ckpt, meta={"smoke": True})
+    fresh = PlateT1Model(YOLOv10.from_ultralytics_pt(str(weights), "s") if weights.exists() else YOLOv10("s").eval())
+    load_plate_t1(fresh, ckpt)
+    ap_fresh = evaluate_ap50(fresh.to(device).eval(), val_loader, device)["ap50"]
+    check(f"t1: reloaded head reproduces AP ({ap_fresh:.3f} vs {ap_t1:.3f})", abs(ap_fresh - ap_t1) < 1e-4)
 
     print(f"\n{'ALL PASS' if not failures else f'{len(failures)} FAILURES: {failures}'}")
     sys.exit(1 if failures else 0)
